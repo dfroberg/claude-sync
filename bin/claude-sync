@@ -83,9 +83,24 @@ apply(){
 
 git_repo(){ [ -d "$REPO/.git" ] || die "no git repo at $REPO (bootstrap it first)"; }
 
+# Auto-unlock git-crypt on a fresh clone: if data/ is still ciphertext and the
+# sops-decrypted key exists (placed by dotnix decryptSecrets), unlock non-interactively.
+KEYFILE="${CLAUDE_SYNC_KEY:-$HOME/.config/git-crypt/claude-sync.key}"
+ensure_unlocked(){
+  [ -f "$DATA/CLAUDE.md" ] || return 0
+  head -c 12 "$DATA/CLAUDE.md" 2>/dev/null | grep -qa GITCRYPT || return 0   # already unlocked
+  if [ -f "$KEYFILE" ]; then
+    log "git-crypt locked; unlocking with $KEYFILE"
+    ( cd "$REPO" && git-crypt unlock "$KEYFILE" ) 2>/dev/null || log "git-crypt unlock failed (bad key?)"
+  else
+    log "git-crypt locked and no key at $KEYFILE (run 'nud' to decrypt it, then retry)"
+  fi
+}
+
 cmd_push(){
   acquire_lock; git_repo
   git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || log "pull skipped (offline / no upstream yet)"
+  ensure_unlocked
   collect
   git -C "$REPO" add -A
   if git -C "$REPO" diff --cached --quiet; then log "no changes"; return 0; fi
@@ -96,6 +111,7 @@ cmd_push(){
 cmd_pull(){
   acquire_lock; git_repo
   git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || { log "pull skipped (offline?)"; return 0; }
+  ensure_unlocked
   [ -d "$DATA" ] && apply && log "applied" || log "nothing to apply"
 }
 
