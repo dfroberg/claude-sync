@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# claude-sync — sync ~/.claude memories/settings/skills across machines via a
+# git-crypt-encrypted git repo, with user/path canonicalization.
+#
+# The repo stores a curated ALLOWLIST (never transcripts/caches/plugins/auth).
+# Paths are canonicalized to a __USER__ sentinel on push and rehydrated to the
+# local user on pull, so dfroberg and dannyfroberg are the same person.
+#
+#   claude-sync push      collect ~/.claude -> repo, commit, push
+#   claude-sync pull      pull repo -> apply into ~/.claude
+#   claude-sync dry-run   collect only (no git); print what would sync
+#   claude-sync status    git status of the sync repo
+set -euo pipefail
+
+REPO="${CLAUDE_SYNC_REPO:-$HOME/.claude-sync}"
+CLAUDE="$HOME/.claude"
+DATA="$REPO/data"
+TOKEN="__USER__"
+ME="$(id -un)"
+BRANCH="${CLAUDE_SYNC_BRANCH:-main}"
+LOCKDIR="$REPO/.sync.lock.d"
+
+log(){ printf '[claude-sync] %s\n' "$*" >&2; }
+die(){ log "ERROR: $*"; exit 1; }
+
+# ---- allowlist (relative to ~/.claude). Memories handled specially below. ----
+FILES=(CLAUDE.md settings.json mcp_settings.json keybindings.json)
+DIRS=(skills agents commands hooks)
+
+# Only rewrite paths inside text files; copy everything else verbatim.
+is_text(){ case "$1" in *.md|*.json|*.jsonl|*.txt|*.sh|*.bash|*.zsh|*.lua|*.toml|*.yaml|*.yml|*.cfg) return 0;; *) return 1;; esac; }
+canon_file(){   if is_text "$1"; then sed "s|/Users/$ME/|/Users/$TOKEN/|g; s|-Users-$ME-|-Users-$TOKEN-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; }
+decanon_file(){ if is_text "$1"; then sed "s|/Users/$TOKEN/|/Users/$ME/|g; s|-Users-$TOKEN-|-Users-$ME-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; }
+
+acquire_lock(){ mkdir "$LOCKDIR" 2>/dev/null || { log "another sync is running; skipping"; exit 0; }; trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT; }
+
+# ~/.claude -> data/ (canonicalized). Rebuilds data/ from scratch each time.
+collect(){
+  rm -rf "$DATA"; mkdir -p "$DATA"
+  for f in "${FILES[@]}"; do
+    [ -f "$CLAUDE/$f" ] || continue
+    mkdir -p "$DATA/$(dirname "$f")"; canon_file "$CLAUDE/$f" "$DATA/$f"
+  done
+  for d in "${DIRS[@]}"; do
+    [ -d "$CLAUDE/$d" ] || continue
+    while IFS= read -r -d '' p; do
+      rel="${p#"$CLAUDE"/}"; mkdir -p "$DATA/$(dirname "$rel")"; canon_file "$p" "$DATA/$rel"
+    done < <(find "$CLAUDE/$d" -type f -print0)
+  done
+  # memories: ~/.claude/projects/<proj>/memory/**  ->  data/memory/<canonical-proj>/**
+  for m in "$CLAUDE"/projects/*/memory; do
+    [ -d "$m" ] || continue
+    proj="$(basename "$(dirname "$m")")"
+    cproj="${proj//-Users-$ME-/-Users-$TOKEN-}"
+    while IFS= read -r -d '' p; do
+      rel="${p#"$m"/}"; mkdir -p "$DATA/memory/$cproj/$(dirname "$rel")"; canon_file "$p" "$DATA/memory/$cproj/$rel"
+    done < <(find "$m" -type f -print0)
+  done
+}
+
+# data/ -> ~/.claude (decanonicalized). Additive merge — never deletes local files.
+apply(){
+  for f in "${FILES[@]}"; do
+    [ -f "$DATA/$f" ] || continue
+    mkdir -p "$CLAUDE/$(dirname "$f")"; decanon_file "$DATA/$f" "$CLAUDE/$f"
+  done
+  for d in "${DIRS[@]}"; do
+    [ -d "$DATA/$d" ] || continue
+    while IFS= read -r -d '' p; do
+      rel="${p#"$DATA"/}"; mkdir -p "$CLAUDE/$(dirname "$rel")"; decanon_file "$p" "$CLAUDE/$rel"
+    done < <(find "$DATA/$d" -type f -print0)
+  done
+  for cm in "$DATA"/memory/*; do
+    [ -d "$cm" ] || continue
+    cproj="$(basename "$cm")"
+    proj="${cproj//-Users-$TOKEN-/-Users-$ME-}"
+    dst="$CLAUDE/projects/$proj/memory"
+    while IFS= read -r -d '' p; do
+      rel="${p#"$cm"/}"; mkdir -p "$dst/$(dirname "$rel")"; decanon_file "$p" "$dst/$rel"
+    done < <(find "$cm" -type f -print0)
+  done
+}
+
+git_repo(){ [ -d "$REPO/.git" ] || die "no git repo at $REPO (bootstrap it first)"; }
+
+cmd_push(){
+  acquire_lock; git_repo
+  git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || log "pull skipped (offline / no upstream yet)"
+  collect
+  git -C "$REPO" add -A
+  if git -C "$REPO" diff --cached --quiet; then log "no changes"; return 0; fi
+  git -C "$REPO" commit -q -m "sync: $ME@$(scutil --get LocalHostName 2>/dev/null || hostname -s) $(date -u +%FT%TZ)"
+  git -C "$REPO" push -q origin "$BRANCH" 2>/dev/null && log "pushed" || log "push failed (offline?) — committed locally"
+}
+
+cmd_pull(){
+  acquire_lock; git_repo
+  git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || { log "pull skipped (offline?)"; return 0; }
+  [ -d "$DATA" ] && apply && log "applied" || log "nothing to apply"
+}
+
+case "${1:-}" in
+  push)          cmd_push;;
+  pull)          cmd_pull;;
+  status)        git_repo; git -C "$REPO" status -sb;;
+  dry-run|dry)   collect; log "canonicalized into $DATA:"; find "$DATA" -type f | sed "s|$DATA/||" | sort;;
+  *) echo "usage: claude-sync {push|pull|status|dry-run}"; exit 2;;
+esac

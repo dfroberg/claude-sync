@@ -1,0 +1,4 @@
+# Everything under data/ is encrypted at rest via git-crypt (safe for a public repo).
+# The script, manifest, and README stay plaintext so a fresh machine can run
+# `claude-sync` and `git-crypt unlock` before anything is decrypted.
+data/** filter=git-crypt diff=git-crypt
