@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# memory-lint — deterministic conformance check for ~/.claude memory files and indexes.
+#
+#   memory-lint            check every project under ~/.claude/projects/*/memory
+#   memory-lint <dir>      check one memory dir
+#
+# No LLM, no network, no writes. Exits 1 if anything needs attention, so it can gate a
+# commit or just be run by hand.
+#
+# It exists because eyeballing this is unreliable. Two mistakes made on 2026-07-27 while
+# auditing by hand, both of which this would have caught instantly:
+#   * `grep -cE '^- \['` was used to count index entries. slack-warroom-sync packs 2-3
+#     links onto one line, so 50 lines held 108 links -- the count was wrong by half.
+#   * "177 files are missing metadata.type" was wrong. Two frontmatter schemas are in use,
+#     a flat `type:` and a nested `metadata: type:`, and only the nested one was matched.
+#     Acting on it would have inserted duplicate keys into 177 files.
+# Anything counting these files must handle BOTH schemas and count LINKS, not lines.
+set -uo pipefail
+
+ROOTS=()
+if [ $# -gt 0 ]; then ROOTS=("$@"); else
+  for d in "$HOME"/.claude/projects/*/memory; do [ -d "$d" ] && ROOTS+=("$d"); done
+fi
+
+BIG_BYTES="${MEMORY_LINT_BIG:-6000}"
+problems=0; advisories=0
+# Errors fail the run; advisories are judgement calls that should not gate anything.
+# Size in particular is a heuristic -- a 48KB project log may be exactly right.
+note(){   printf '  %s\n' "$*"; problems=$((problems+1)); }
+advise(){ printf '  (advisory) %s\n' "$*"; advisories=$((advisories+1)); }
+
+frontmatter(){ awk '/^---$/{n++; if(n==2) exit} n>=1' "$1"; }
+links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | tr -d ']()' | sort -u; }
+n_links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+for dir in "${ROOTS[@]}"; do
+  proj=$(basename "$(dirname "$dir")")
+  hdr_shown=0
+  hdr(){ [ "$hdr_shown" = 0 ] && { printf '\n%s\n' "$proj"; hdr_shown=1; }; }
+
+  mem="$dir/MEMORY.md"
+
+  # --- per-file frontmatter ---------------------------------------------------
+  for f in "$dir"/*.md; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f"); [ "$b" = "MEMORY.md" ] && continue
+    if ! head -1 "$f" | grep -q '^---$'; then
+      hdr; note "no frontmatter: $b"; continue
+    fi
+    fm=$(frontmatter "$f")
+    echo "$fm" | grep -q '^name:'        || { hdr; note "no name: $b"; }
+    echo "$fm" | grep -q '^description:' || { hdr; note "no description (recall matches on this): $b"; }
+    # BOTH schemas are legal here. Do not "fix" one into the other without evidence it matters.
+    echo "$fm" | grep -qE '^(  )?type: (user|feedback|project|reference)' \
+      || { hdr; note "no valid type: $b"; }
+    sz=$(wc -c < "$f" | tr -d ' ')
+    [ "$sz" -gt "$BIG_BYTES" ] && { hdr; advise "${sz}B - may hold several facts: $b"; }
+  done
+
+  # --- index ------------------------------------------------------------------
+  [ -f "$mem" ] || { hdr; note "no MEMORY.md"; continue; }
+
+  ml=$(wc -l < "$mem" | tr -d ' '); mk=$(n_links "$mem")
+  if [ "$ml" -gt 40 ] && [ "$mk" -lt $(( ml / 8 )) ]; then
+    hdr; advise "MEMORY.md is freeform notes, not an index ($ml lines, $mk links) - loads into context every session"
+  fi
+
+  # orphans: a file exists but nothing links it, so no session will ever see it
+  orph=$(comm -23 <(ls "$dir"/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | grep -v '^MEMORY.md$' | sort -u) <(links "$mem"))
+  [ -n "$orph" ] && { hdr; note "$(echo "$orph" | wc -l | tr -d ' ') orphaned file(s), unreachable from the index: $(echo "$orph" | head -3 | tr '\n' ' ')..."; }
+
+  # dead links: kept, not deleted -- the file may live on the other machine and not be synced yet
+  while read -r l; do
+    [ -z "$l" ] && continue
+    [ -f "$dir/$l" ] || { hdr; note "index links a file that is not here: $l (may be unsynced from the other machine)"; }
+  done <<< "$(links "$mem")"
+done
+
+echo
+printf 'memory-lint: %s error(s), %s advisory(ies)\n' "$problems" "$advisories"
+[ "$problems" -eq 0 ] && exit 0
+exit 1

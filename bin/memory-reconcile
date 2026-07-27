@@ -50,6 +50,7 @@ log(){ printf '[memory-reconcile] %s\n' "$*" >&2; }
 [ "${CLAUDE_SYNC_RECONCILING:-0}" = "1" ] && exit 0
 [ -f "$MEM" ] || { log "$DIR: no MEMORY.md; skipping"; exit 0; }
 
+
 links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | tr -d ']()' | sort -u; }
 n_links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | wc -l | tr -d ' '; }
 
@@ -91,6 +92,21 @@ fi
 
 n_orphans=0; [ -n "$orphans" ] && n_orphans=$(echo "$orphans" | wc -l | tr -d ' ')
 proj=$(basename "$(dirname "$DIR")")
+
+# Not every MEMORY.md is an index. Some projects use it as a long freeform notes file --
+# groundcover-alert-correlator is 288 lines with 3 links, jira-pir-publish 192 with 3. This
+# tool rewrites an INDEX; turned loose on prose it would restructure the whole document and
+# strip formatting that is there on purpose. Index files are link-dense (eeze: 28 links in
+# 60 lines; warroom-sync: 108 in 103), notes files are not, so the ratio separates them
+# cleanly. Converting notes into a real index is a deliberate, reviewed job, not something
+# a background sync should do behind your back.
+# Checked AFTER the drift gate so it stays silent unless it would actually have acted.
+_ml=$(wc -l < "$MEM" | tr -d ' ')
+if [ "$_ml" -gt 40 ] && [ "$(n_links "$MEM")" -lt $(( _ml / 8 )) ]; then
+  log "$proj: MEMORY.md looks like freeform notes ($_ml lines, $(n_links "$MEM") links), not an"
+  log "$proj: index. Skipping rather than restructuring prose. Converting it is a manual job."
+  exit 0
+fi
 [ -n "$orphans" ]      && log "$proj: $n_orphans orphaned file(s)"
 [ -n "$prev_missing" ] && log "$proj: $(echo "$prev_missing" | wc -l | tr -d ' ') entr(ies) present before the pull but not after"
 
