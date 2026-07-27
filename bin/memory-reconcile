@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# memory-reconcile — keep a project's MEMORY.md index consistent with its memory files,
+# and merge two machines' indexes without losing either side's curation.
+#
+#   memory-reconcile <memory-dir> [previous-MEMORY.md]
+#
+# MEMORY.md is the index that loads each session, and it is the one file both machines
+# write at the same canonical path (~/eeze on either Mac canonicalizes to
+# data/memory/-Users-__USER__-eeze/). apply() is additive for memory FILES but overwrites
+# MEMORY.md wholesale, so whichever machine pushes last publishes an index built only from
+# ITS OWN files -- and the other side's entries are silently orphaned. The files survive;
+# the index entries do not. Seen 2026-07-27 in both directions.
+#
+# A textual merge cannot fix this well: section placement and hook wording are judgement
+# calls, and the hooks in the index are deliberately richer than the frontmatter
+# descriptions. So the merge is delegated to `claude -p`, with a deterministic gate around
+# it: the model may only ADD, never drop. If it drops anything, its output is discarded.
+#
+# Two hard constraints, both learned the hard way:
+#   * `--settings '{"disableAllHooks":true}'` is mandatory. This runs FROM claude-sync,
+#     which runs from SessionStart/SessionEnd hooks; a nested session with hooks enabled
+#     would invoke claude-sync again, forever. `--bare` also stops hooks but skips keychain
+#     reads, so OAuth fails ("Not logged in") -- it is not an option here.
+#   * CLAUDE_SYNC_RECONCILING=1 is exported as a second, independent guard: claude-sync
+#     itself exits early when it sees it, so even a nested session that somehow ran hooks
+#     cannot recurse.
+set -uo pipefail
+
+DIR="${1:-}"
+PREV="${2:-}"
+[ -d "$DIR" ] || { echo "usage: memory-reconcile <memory-dir> [previous-MEMORY.md]" >&2; exit 2; }
+
+MEM="$DIR/MEMORY.md"
+MODEL="${CLAUDE_SYNC_RECONCILE_MODEL:-claude-sonnet-5}"
+
+log(){ printf '[memory-reconcile] %s\n' "$*" >&2; }
+
+# Already inside a reconcile -> never nest.
+[ "${CLAUDE_SYNC_RECONCILING:-0}" = "1" ] && exit 0
+[ -f "$MEM" ] || { log "$DIR: no MEMORY.md; skipping"; exit 0; }
+
+links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | tr -d ']()' | sort -u; }
+
+# --- inventory: the files are the ground truth -------------------------------
+inventory(){
+  for f in "$DIR"/*.md; do
+    b=$(basename "$f")
+    [ "$b" = "MEMORY.md" ] && continue
+    d=$(grep -m1 '^description:' "$f" 2>/dev/null | sed 's/^description: *//; s/^"//; s/"$//')
+    printf '%s\t%s\n' "$b" "${d:-<no description in frontmatter>}"
+  done
+}
+
+# --- cheap drift gate: never pay for an LLM call unless something is actually wrong ---
+orphans=$(comm -23 <(inventory | cut -f1 | sort -u) <(links "$MEM"))
+prev_missing=""
+[ -n "$PREV" ] && [ -f "$PREV" ] && prev_missing=$(comm -23 <(links "$PREV") <(links "$MEM"))
+
+if [ -z "$orphans" ] && [ -z "$prev_missing" ]; then
+  exit 0
+fi
+
+[ -n "$orphans" ]      && log "$(basename "$DIR"): $(echo "$orphans" | wc -l | tr -d ' ') orphaned file(s)"
+[ -n "$prev_missing" ] && log "$(basename "$DIR"): $(echo "$prev_missing" | wc -l | tr -d ' ') entr(ies) present before the pull but not after"
+
+command -v claude >/dev/null 2>&1 || { log "claude CLI not found; leaving index untouched"; exit 0; }
+
+# --- build the merge request -------------------------------------------------
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+BACKUP="$TMP/MEMORY.md.backup"; cp "$MEM" "$BACKUP"
+
+{
+  echo "Merge a Claude Code MEMORY.md index. Output ONLY the merged markdown - no commentary, no code fences."
+  echo
+  echo "MEMORY.md is an index of memory files. Each entry is: - [Title](file.md) — short hook"
+  echo "It is grouped under ## sections. Two machines each rewrite this file from their own"
+  echo "local files, so entries the other machine added go missing. Your job is to produce the UNION."
+  echo
+  echo "RULES:"
+  echo "1. NEVER drop an existing entry, section, or hook. Preserve wording exactly where it already exists."
+  echo "2. Every file in AUTHORITATIVE FILE LIST must appear exactly once."
+  echo "3. Add a missing entry to the ## section that best fits its subject. Only if none fits, use '## Unfiled'."
+  echo "4. For a new entry, write a concise hook from its description. Keep existing hooks verbatim."
+  echo "5. Keep an index entry whose file is absent - it may exist on the other machine and not be synced here yet."
+  echo "6. Preserve the title line and any preamble at the top of the file."
+  echo
+  echo "=== AUTHORITATIVE FILE LIST (filename<TAB>description) ==="
+  inventory
+  echo
+  echo "=== CURRENT MEMORY.md (this machine, after sync) ==="
+  cat "$MEM"
+  if [ -n "$PREV" ] && [ -f "$PREV" ]; then
+    echo
+    echo "=== PREVIOUS MEMORY.md (this machine, BEFORE the sync overwrote it) ==="
+    echo "Entries here that are absent above were lost by the overwrite. Restore them."
+    cat "$PREV"
+  fi
+} > "$TMP/prompt.txt"
+
+log "$(basename "$DIR"): merging via claude ($MODEL)"
+# stdin MUST be closed explicitly. Invoked from a hook or a launchd agent, stdin is neither
+# a TTY nor EOF, so claude waits on it and gives up: "no stdin data received in 3s".
+# Interactively it worked, because stdin was a terminal -- the failure only appears where it
+# actually has to run.
+if ! CLAUDE_SYNC_RECONCILING=1 claude -p --model "$MODEL" \
+      --settings '{"disableAllHooks":true}' \
+      "$(cat "$TMP/prompt.txt")" > "$TMP/merged.md" 2>"$TMP/err.txt" </dev/null; then
+  log "claude failed; index left untouched. stderr: $(head -2 "$TMP/err.txt" | tr '\n' ' ')"
+  exit 0
+fi
+
+sed -i '' -e '/^```/d' "$TMP/merged.md" 2>/dev/null || true
+
+# --- validation gate: the model may only ADD ---------------------------------
+# Anything less than this and a hallucinated or truncated response silently eats the index.
+fail=""
+[ -s "$TMP/merged.md" ] || fail="empty output"
+[ -z "$fail" ] && [ "$(grep -cE '^- \[' "$TMP/merged.md")" -lt "$(grep -cE '^- \[' "$BACKUP")" ] \
+  && fail="fewer entries than before ($(grep -cE '^- \[' "$TMP/merged.md") < $(grep -cE '^- \[' "$BACKUP"))"
+
+if [ -z "$fail" ]; then
+  required="$TMP/required"; : > "$required"
+  links "$BACKUP" >> "$required"
+  [ -n "$PREV" ] && [ -f "$PREV" ] && links "$PREV" >> "$required"
+  inventory | cut -f1 >> "$required"
+  sort -u -o "$required" "$required"
+  lost=$(comm -23 "$required" <(links "$TMP/merged.md"))
+  [ -n "$lost" ] && fail="dropped: $(echo "$lost" | tr '\n' ' ')"
+fi
+
+if [ -n "$fail" ]; then
+  cp "$TMP/merged.md" "$DIR/.MEMORY.md.rejected" 2>/dev/null || true
+  log "REJECTED merge ($fail). Index unchanged; candidate saved to $DIR/.MEMORY.md.rejected"
+  exit 1
+fi
+
+cp "$TMP/merged.md" "$MEM"
+log "$(basename "$DIR"): index reconciled ($(grep -cE '^- \[' "$BACKUP") -> $(grep -cE '^- \[' "$MEM") entries)"

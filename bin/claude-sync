@@ -23,6 +23,29 @@ LOCKDIR="$REPO/.sync.lock.d"
 log(){ printf '[claude-sync] %s\n' "$*" >&2; }
 die(){ log "ERROR: $*"; exit 1; }
 
+# Recursion guard. memory-reconcile shells out to `claude`, and this script runs FROM
+# SessionStart/SessionEnd hooks -- so a nested session that ran hooks would re-enter here
+# forever. memory-reconcile passes --settings '{"disableAllHooks":true}', which should make
+# that impossible; this is the independent second line of defence in case it ever does not.
+[ "${CLAUDE_SYNC_RECONCILING:-0}" = "1" ] && { log "nested invocation; skipping"; exit 0; }
+
+RECONCILE="$REPO/bin/memory-reconcile"
+
+# Bring every project's MEMORY.md back in line with its files. $1, if given, is a directory
+# of pre-apply MEMORY.md snapshots keyed by project, used to recover entries the apply
+# overwrote. Never fatal: a broken index is worth fixing, never worth failing a sync over.
+reconcile_indexes(){
+  [ -x "$RECONCILE" ] || return 0
+  snaps="${1:-}"
+  for m in "$CLAUDE"/projects/*/memory; do
+    [ -d "$m" ] || continue
+    proj="$(basename "$(dirname "$m")")"
+    prev=""
+    [ -n "$snaps" ] && [ -f "$snaps/$proj/MEMORY.md" ] && prev="$snaps/$proj/MEMORY.md"
+    "$RECONCILE" "$m" $prev || true
+  done
+}
+
 # ---- allowlist (relative to ~/.claude). Memories handled specially below. ----
 FILES=(CLAUDE.md settings.json mcp_settings.json keybindings.json)
 DIRS=(skills agents commands hooks)
@@ -112,6 +135,12 @@ cmd_push(){
   acquire_lock; git_repo
   git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || log "pull skipped (offline / no upstream yet)"
   ensure_unlocked
+
+  # Fold in any orphans before collect, so the index this machine publishes is already
+  # complete. Combined with the post-apply pass in cmd_pull, the index converges to the
+  # union across machines without anyone having to merge markdown by hand.
+  reconcile_indexes
+
   collect
   git -C "$REPO" add -A
 
@@ -164,7 +193,22 @@ cmd_pull(){
   acquire_lock; git_repo
   git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || { log "pull skipped (offline?)"; return 0; }
   ensure_unlocked
+
+  # Snapshot every MEMORY.md BEFORE apply overwrites it. apply is additive for memory
+  # files but replaces the index outright, so without this the entries this machine added
+  # since the last sync are simply gone -- the files stay, orphaned and invisible to future
+  # sessions, because MEMORY.md is what actually loads.
+  SNAPS=$(mktemp -d)
+  for m in "$CLAUDE"/projects/*/memory; do
+    [ -f "$m/MEMORY.md" ] || continue
+    proj="$(basename "$(dirname "$m")")"
+    mkdir -p "$SNAPS/$proj" && cp "$m/MEMORY.md" "$SNAPS/$proj/MEMORY.md"
+  done
+
   [ -d "$DATA" ] && apply && log "applied" || log "nothing to apply"
+
+  reconcile_indexes "$SNAPS"
+  rm -rf "$SNAPS"
 }
 
 case "${1:-}" in
