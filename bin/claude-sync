@@ -75,7 +75,24 @@ copy_mode(){ m=$(file_mode "$1"); [ -n "$m" ] && chmod "$m" "$2" 2>/dev/null || 
 canon_file(){   if is_text "$1"; then sed "s|/Users/$ME/|/Users/$TOKEN/|g; s|-Users-$ME-|-Users-$TOKEN-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; copy_mode "$1" "$2"; }
 decanon_file(){ if is_text "$1"; then sed "s|/Users/$TOKEN/|/Users/$ME/|g; s|-Users-$TOKEN-|-Users-$ME-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; copy_mode "$1" "$2"; }
 
-acquire_lock(){ mkdir "$LOCKDIR" 2>/dev/null || { log "another sync is running; skipping"; exit 0; }; trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT; }
+# The EXIT trap releases the lock on a normal exit or a SIGTERM, but NOT on SIGKILL -- and a
+# run killed by a caller's timeout is exactly when that happens. The leftover directory then
+# wedges every later sync, silently and with exit 0: "another sync is running", forever.
+# Observed 2026-07-27 after a reconcile pass was killed at five minutes. So a lock older
+# than the longest plausible run is treated as abandoned rather than trusted.
+acquire_lock(){
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    age=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+    if [ "$age" -gt "${CLAUDE_SYNC_LOCK_STALE:-900}" ]; then
+      log "breaking stale lock (${age}s old; a previous run was killed)"
+      rmdir "$LOCKDIR" 2>/dev/null
+      mkdir "$LOCKDIR" 2>/dev/null || { log "another sync is running; skipping"; exit 0; }
+    else
+      log "another sync is running; skipping"; exit 0
+    fi
+  fi
+  trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+}
 
 # ~/.claude -> data/ (canonicalized). Rebuilds data/ from scratch each time.
 collect(){
