@@ -103,9 +103,27 @@ cmd_push(){
   ensure_unlocked
   collect
   git -C "$REPO" add -A
-  if git -C "$REPO" diff --cached --quiet; then log "no changes"; return 0; fi
-  git -C "$REPO" commit -q -m "sync: $ME@$(scutil --get LocalHostName 2>/dev/null || hostname -s) $(date -u +%FT%TZ)"
-  git -C "$REPO" push -q origin "$BRANCH" 2>/dev/null && log "pushed" || log "push failed (offline?) — committed locally"
+  if git -C "$REPO" diff --cached --quiet; then
+    log "no changes"
+  else
+    git -C "$REPO" commit -q -m "sync: $ME@$(scutil --get LocalHostName 2>/dev/null || hostname -s) $(date -u +%FT%TZ)"
+  fi
+
+  # Push whenever the branch is ahead, NOT only when this run produced a commit.
+  # "no changes" used to return here, before the push -- so a commit stranded by an
+  # earlier failed push was never retried by any later run. Observed 2026-07-27: three
+  # commits, oldest 36h, all absent from the remote while every run reported success.
+  ahead=$(git -C "$REPO" rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
+  if [ "$ahead" -eq 0 ]; then log "up to date"; return 0; fi
+
+  if git -C "$REPO" push -q origin "$BRANCH" 2>/dev/null; then
+    log "pushed ($ahead commit(s))"
+  else
+    # Propagate the failure. The old `push && log || log` always evaluated to 0, so the
+    # timer wrapper's "re-flag and retry" branch was unreachable dead code.
+    log "push failed (offline?) — $ahead commit(s) queued locally"
+    return 1
+  fi
 }
 
 cmd_pull(){
