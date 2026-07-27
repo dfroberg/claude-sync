@@ -51,6 +51,24 @@ log(){ printf '[memory-reconcile] %s\n' "$*" >&2; }
 [ -f "$MEM" ] || { log "$DIR: no MEMORY.md; skipping"; exit 0; }
 
 links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | tr -d ']()' | sort -u; }
+n_links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+# Measured shape of the existing index, handed to the model as evidence rather than left to
+# impression. Indexes here do not share one format: eeze is one link per line, while
+# slack-warroom-sync deliberately packs 2-3 links onto a line with dense shorthand and says
+# so in its own header. Imposing either style on the other would destroy real curation.
+index_shape(){
+  el=$(grep -cE '^- ' "$1" 2>/dev/null || echo 0)
+  multi=$(grep -E '^- ' "$1" 2>/dev/null | awk '{n=gsub(/\]\([^)]+\.md\)/,"&"); if(n>1) c++} END{print c+0}')
+  echo "entry lines: $el"
+  echo "total links: $(n_links "$1")"
+  echo "entry lines carrying 2 or more links: $multi"
+  if [ "${multi:-0}" -gt 0 ]; then
+    echo "=> THIS INDEX PACKS several links onto one line. Keep packing; do NOT unpack."
+  else
+    echo "=> THIS INDEX USES ONE LINK PER LINE. Keep it that way; do NOT pack."
+  fi
+}
 
 # --- inventory: the files are the ground truth -------------------------------
 inventory(){
@@ -101,8 +119,14 @@ BACKUP="$TMP/MEMORY.md.backup"; cp "$MEM" "$BACKUP"
   echo "2. Every file in AUTHORITATIVE FILE LIST must appear exactly once."
   echo "3. Add a missing entry to the ## section that best fits its subject. Only if none fits, use '## Unfiled'."
   echo "4. For a new entry, write a concise hook from its description. Keep existing hooks verbatim."
-  echo "4a. Match the house format exactly: '- [Human Readable Title](file.md) — hook'."
-  echo "    The title is prose, NEVER the filename, and the separator is an em dash, not a hyphen."
+  echo "4a. MATCH THE FORMAT THIS INDEX ALREADY USES. Do not impose a different one."
+  echo "    Copy its conventions exactly from the existing entries: separator character,"
+  echo "    heading depth, blank-line spacing, and how dense the hooks are."
+  echo "4b. Crucially, match its PACKING. Some indexes put one link per line; others pack"
+  echo "    2-3 links onto a single line with dense shorthand (versions, dates, ticket IDs,"
+  echo "    '->' arrows). If this index packs, keep packing. NEVER unpack existing lines into"
+  echo "    one-per-line entries, and never pack an index that is one-per-line."
+  echo "4c. Titles are prose, never a bare filename."
   echo "5. Keep an index entry whose file is absent - it may exist on the other machine and not be synced here yet."
   echo "6. Preserve the title line and any preamble at the top of the file."
   echo
@@ -120,6 +144,9 @@ BACKUP="$TMP/MEMORY.md.backup"; cp "$MEM" "$BACKUP"
   echo
   echo "=== AUTHORITATIVE FILE LIST (filename<TAB>description) ==="
   inventory
+  echo
+  echo "=== FORMAT OF THIS INDEX (measured - match it) ==="
+  index_shape "$MEM"
   echo
   echo "=== CURRENT MEMORY.md (this machine, after sync) ==="
   cat "$MEM"
@@ -163,8 +190,11 @@ sed -i '' -e '/^```/d' "$TMP/merged.md" 2>/dev/null || true
 # Anything less than this and a hallucinated or truncated response silently eats the index.
 fail=""
 [ -s "$TMP/merged.md" ] || fail="empty output"
-[ -z "$fail" ] && [ "$(grep -cE '^- \[' "$TMP/merged.md")" -lt "$(grep -cE '^- \[' "$BACKUP")" ] \
-  && fail="fewer entries than before ($(grep -cE '^- \[' "$TMP/merged.md") < $(grep -cE '^- \[' "$BACKUP"))"
+# Count LINKS, not lines beginning '- ['. On a packed index one line carries 2-3 links, so a
+# line count says nothing about whether anything was lost -- and would false-reject a
+# correctly re-packed index while missing a wrongly unpacked one.
+[ -z "$fail" ] && [ "$(n_links "$TMP/merged.md")" -lt "$(n_links "$BACKUP")" ] \
+  && fail="fewer links than before ($(n_links "$TMP/merged.md") < $(n_links "$BACKUP"))"
 
 if [ -z "$fail" ]; then
   required="$TMP/required"; : > "$required"
@@ -183,4 +213,4 @@ if [ -n "$fail" ]; then
 fi
 
 cp "$TMP/merged.md" "$MEM"
-log "$proj: index reconciled ($(grep -cE '^- \[' "$BACKUP") -> $(grep -cE '^- \[' "$MEM") entries)"
+log "$proj: index reconciled ($(n_links "$BACKUP") -> $(n_links "$MEM") links)"
