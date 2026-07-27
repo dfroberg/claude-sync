@@ -51,6 +51,13 @@ nsess=$(wc -l < "$TMP/sessions" | tr -d ' '); nrest=$(wc -l < "$TMP/rest" | tr -
 log "$total orphans: $nsess session logs (grouped deterministically), $nrest to group via $MODEL"
 
 : > "$TMP/new"
+# Only if the index does not already cover them. Running this tool twice previously added a
+# second and third "19 session logs ..." line, because the original index already had one
+# inside an existing section and nothing checked.
+if grep -qiE 'session logs?' "$MEM"; then
+  log "index already references session logs; leaving those $nsess alone"
+  nsess=0
+fi
 if [ "$nsess" -gt 0 ]; then
   first=$(head -1 "$TMP/sessions"); last=$(tail -1 "$TMP/sessions")
   fd=$(echo "$first" | grep -oE '[0-9]{4}_[0-9]{2}_[0-9]{2}' | tr '_' '-')
