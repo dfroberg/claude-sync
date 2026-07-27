@@ -1,1 +1,10 @@
 .sync.lock.d/
+
+# Local push-pending flag. Machine-local state, never shared: syncing it would make the
+# other machine think it has unsynced work. It normally does not exist by the time
+# `add -A` runs (the timer clears it first), but a write landing mid-push re-creates it
+# -- which is exactly the race the re-flag logic depends on.
+.dirty
+
+# Local push log; noisy, machine-specific, and plaintext in a public repo.
+last-sync.log
