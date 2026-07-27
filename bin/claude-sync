@@ -103,6 +103,29 @@ cmd_push(){
   ensure_unlocked
   collect
   git -C "$REPO" add -A
+
+  # Tripwire. collect() rebuilds data/ from THIS machine's ~/.claude with `rm -rf`, and
+  # the pull above refreshes the repo WITHOUT applying anything into ~/.claude. So a
+  # machine that is behind -- most dangerously one that has just cloned -- produces a
+  # perfectly ordinary-looking commit that deletes everything the other machine owns.
+  # Measured 2026-07-27 on a fresh clone against a 5-file home: 557 deletions, the whole
+  # memory store plus every skill, agent and command. It then happened for real.
+  #
+  # Bulk deletion is therefore never assumed intentional. Real pruning says so explicitly:
+  #   CLAUDE_SYNC_ALLOW_PRUNE=1 claude-sync push
+  if [ "${CLAUDE_SYNC_ALLOW_PRUNE:-0}" != "1" ]; then
+    dels=$(git -C "$REPO" diff --cached --diff-filter=D --name-only | wc -l | tr -d ' ')
+    keep=$(git -C "$REPO" diff --cached --diff-filter=d --name-only | wc -l | tr -d ' ')
+    if [ "$dels" -gt 20 ] && [ "$dels" -gt "$keep" ]; then
+      log "REFUSING to push: would delete $dels files and keep only $keep."
+      log "This machine looks out of date. Run 'claude-sync pull' first to apply the"
+      log "remote into ~/.claude, verify your files, then push."
+      log "If the deletion really is intended: CLAUDE_SYNC_ALLOW_PRUNE=1 claude-sync push"
+      git -C "$REPO" reset -q
+      return 1
+    fi
+  fi
+
   if git -C "$REPO" diff --cached --quiet; then
     log "no changes"
   else
