@@ -22,7 +22,14 @@ if [ $# -gt 0 ]; then ROOTS=("$@"); else
   for d in "$HOME"/.claude/projects/*/memory; do [ -d "$d" ] && ROOTS+=("$d"); done
 fi
 
-BIG_BYTES="${MEMORY_LINT_BIG:-6000}"
+# Size alone is a bad proxy for "several facts". The house style here is dense: project_*
+# files are append-only chronological journals whose lines are packed updates
+# ("**UPDATE 2026-06-16 ... SHIPPED v0.553.0**"), median 162 bytes/line, and 16 of the 45
+# files a 6KB threshold flagged had NO headings at all - nothing to split on, and nothing
+# wrong with them. A file only looks genuinely multi-fact when it is both large AND carries
+# several top-level sections, so both must hold before saying anything.
+BIG_BYTES="${MEMORY_LINT_BIG:-20000}"
+BIG_SECTIONS="${MEMORY_LINT_BIG_SECTIONS:-6}"
 problems=0; advisories=0
 # Errors fail the run; advisories are judgement calls that should not gate anything.
 # Size in particular is a heuristic -- a 48KB project log may be exactly right.
@@ -54,7 +61,10 @@ for dir in "${ROOTS[@]}"; do
     echo "$fm" | grep -qE '^(  )?type: (user|feedback|project|reference)' \
       || { hdr; note "no valid type: $b"; }
     sz=$(wc -c < "$f" | tr -d ' ')
-    [ "$sz" -gt "$BIG_BYTES" ] && { hdr; advise "${sz}B - may hold several facts: $b"; }
+    if [ "$sz" -gt "$BIG_BYTES" ]; then
+      secs=$(grep -cE '^## ' "$f")
+      [ "$secs" -ge "$BIG_SECTIONS" ] && { hdr; advise "${sz}B across $secs sections - review whether it is several facts: $b"; }
+    fi
   done
 
   # --- index ------------------------------------------------------------------
