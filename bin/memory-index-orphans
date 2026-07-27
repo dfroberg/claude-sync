@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# memory-index-orphans — bulk-index a project's orphaned memory files as GROUPED entries.
+#
+#   memory-index-orphans <memory-dir> [--batch N] [--dry-run]
+#
+# Distinct from memory-reconcile, which merges a whole index and is meant for sync drift.
+# This is the deliberate bulk job for a project that was never indexed, and it differs in
+# two ways that matter:
+#
+#   * DELTA ONLY. The model is never shown the existing index and never reproduces it; it
+#     emits new lines, which are appended. memory-reconcile failed on this project for
+#     exactly that reason - asking it to restate a 14.5KB index plus 119 new entries meant
+#     ~30KB of output, the generation truncated mid-sentence, and the gate rejected 25
+#     links where 108 were required. A delta cannot lose what it never handles.
+#
+#   * GROUPED, not one-per-line. Indexing warroom-sync's 119 orphans individually would
+#     take its index from 14.5KB to ~44KB loaded EVERY session - tripling the per-session
+#     cost, which is the opposite of why the index is kept thin. Related files share a
+#     line, which also matches that index's existing packed style.
+#
+# Session logs are grouped deterministically, without an LLM call: 19 dated session files
+# need one line saying they exist and how to list them, not 19 entries.
+set -uo pipefail
+
+DIR="${1:-}"
+[ -d "$DIR" ] || { echo "usage: memory-index-orphans <memory-dir> [--batch N] [--dry-run]" >&2; exit 2; }
+BATCH=25; DRY=0
+for a in "$@"; do
+  case "$a" in --batch=*) BATCH="${a#--batch=}" ;; --dry-run) DRY=1 ;; esac
+done
+
+MEM="$DIR/MEMORY.md"
+MODEL="${CLAUDE_SYNC_RECONCILE_MODEL:-claude-sonnet-5}"
+LIMIT="${CLAUDE_SYNC_RECONCILE_TIMEOUT:-300}"
+log(){ printf '[index-orphans] %s\n' "$*" >&2; }
+[ -f "$MEM" ] || { log "no MEMORY.md in $DIR"; exit 1; }
+
+links(){ grep -oE '\]\([^)]+\.md\)' "$1" 2>/dev/null | tr -d ']()' | sort -u; }
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+ls "$DIR"/*.md 2>/dev/null | xargs -n1 basename | grep -v '^MEMORY.md$' | sort -u > "$TMP/all"
+links "$MEM" > "$TMP/linked"
+comm -23 "$TMP/all" "$TMP/linked" > "$TMP/orphans"
+total=$(wc -l < "$TMP/orphans" | tr -d ' ')
+[ "$total" -eq 0 ] && { log "no orphans"; exit 0; }
+
+# Session logs: deterministic single entry, no LLM.
+grep -E '_session_[0-9]{4}' "$TMP/orphans" > "$TMP/sessions" || true
+grep -vE '_session_[0-9]{4}' "$TMP/orphans" > "$TMP/rest" || true
+nsess=$(wc -l < "$TMP/sessions" | tr -d ' '); nrest=$(wc -l < "$TMP/rest" | tr -d ' ')
+log "$total orphans: $nsess session logs (grouped deterministically), $nrest to group via $MODEL"
+
+: > "$TMP/new"
+if [ "$nsess" -gt 0 ]; then
+  first=$(head -1 "$TMP/sessions"); last=$(tail -1 "$TMP/sessions")
+  fd=$(echo "$first" | grep -oE '[0-9]{4}_[0-9]{2}_[0-9]{2}' | tr '_' '-')
+  ld=$(echo "$last"  | grep -oE '[0-9]{4}_[0-9]{2}_[0-9]{2}' | tr '_' '-')
+  {
+    echo "## Session Logs"
+    echo
+    echo "- $nsess session logs ${fd:-} to ${ld:-} as \`project_session_*.md\` in this directory; newest [$ld]($last). Listed rather than indexed individually - they are chronological and rarely recalled by name."
+    echo
+  } >> "$TMP/new"
+fi
+
+desc(){ grep -m1 '^description:' "$DIR/$1" 2>/dev/null | sed 's/^description: *//; s/^"//; s/"$//'; }
+
+n=0; batch=0
+: > "$TMP/batchfiles"
+flush_batch(){
+  [ ! -s "$TMP/batchfiles" ] && return 0
+  batch=$((batch+1))
+  local cnt; cnt=$(wc -l < "$TMP/batchfiles" | tr -d ' ')
+  log "batch $batch: $cnt files"
+  {
+    echo "Group these memory files into index entries for a MEMORY.md. Output ONLY markdown."
+    echo
+    echo "FORMAT - match it exactly:"
+    echo "## Theme Name"
+    echo "(blank line)"
+    echo "- [Title A](file-a.md) · [Title B](file-b.md) — one shared hook covering both"
+    echo
+    echo "RULES:"
+    echo "1. Group 2-4 RELATED files onto one line, separated by ' · '. Only put a file alone if nothing relates to it."
+    echo "2. EVERY file listed below must appear EXACTLY ONCE. Do not invent files."
+    echo "3. Use 2-5 '## Theme' headings total for this batch. Themes describe subject matter."
+    echo "4. Titles are short prose, never the filename. Separator before the hook is an em dash."
+    echo "5. Hooks state the concrete fact - the gotcha, flag, path or number. Terse and specific."
+    echo "6. NO emojis. No 'generated'/'AI'/'Claude' as authorship. No filler like comprehensive, seamless, robust, leverage, powerful."
+    echo
+    echo "FILES (filename<TAB>description):"
+    while IFS= read -r f; do printf '%s\t%s\n' "$f" "$(desc "$f")"; done < "$TMP/batchfiles"
+  } > "$TMP/prompt"
+
+  CLAUDE_SYNC_RECONCILING=1 claude -p --model "$MODEL" --settings '{"disableAllHooks":true}' \
+    "$(cat "$TMP/prompt")" > "$TMP/out" 2>"$TMP/err" </dev/null &
+  local cpid=$!
+  ( sleep "$LIMIT"; kill -TERM "$cpid" 2>/dev/null ) 2>/dev/null & local wpid=$!
+  wait "$cpid"; local rc=$?
+  kill -TERM "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  sed -i '' -e '/^```/d' "$TMP/out" 2>/dev/null || true
+
+  if [ "$rc" -ne 0 ] || [ ! -s "$TMP/out" ]; then
+    log "batch $batch FAILED (rc=$rc); skipped, its files stay orphaned"
+    : > "$TMP/batchfiles"; return 0
+  fi
+  # every batch file must appear exactly once, and nothing else may
+  grep -oE '\]\([^)]+\.md\)' "$TMP/out" | tr -d ']()' | sort > "$TMP/got"
+  sort "$TMP/batchfiles" > "$TMP/want"
+  if ! diff -q <(sort -u "$TMP/got") "$TMP/want" >/dev/null; then
+    log "batch $batch REJECTED: link set does not match ($(wc -l < "$TMP/got" | tr -d ' ') links for $cnt files)"
+    comm -3 <(sort -u "$TMP/got") "$TMP/want" | head -4 | sed 's/^/    /' >&2
+    : > "$TMP/batchfiles"; return 0
+  fi
+  cat "$TMP/out" >> "$TMP/new"; echo >> "$TMP/new"
+  log "batch $batch OK: $cnt files grouped into $(grep -cE '^- ' "$TMP/out") line(s)"
+  : > "$TMP/batchfiles"
+}
+
+while IFS= read -r f; do
+  echo "$f" >> "$TMP/batchfiles"; n=$((n+1))
+  [ $((n % BATCH)) -eq 0 ] && flush_batch
+done < "$TMP/rest"
+flush_batch
+
+added=$(grep -oE '\]\([^)]+\.md\)' "$TMP/new" | wc -l | tr -d ' ')
+log "grouped $added of $total orphans into $(grep -cE '^- ' "$TMP/new") line(s)"
+
+if [ "$DRY" = 1 ]; then
+  echo "----- would append -----"; cat "$TMP/new"; exit 0
+fi
+
+cp "$MEM" "$TMP/backup"
+{ echo; cat "$TMP/new"; } >> "$MEM"
+
+# The index may only grow, and never lose an existing link.
+if [ "$(links "$TMP/backup" | wc -l)" -gt "$(links "$MEM" | wc -l)" ]; then
+  cp "$TMP/backup" "$MEM"; log "ABORTED: index would have lost links; restored"; exit 1
+fi
+log "index: $(wc -c < "$TMP/backup" | tr -d ' ')B -> $(wc -c < "$MEM" | tr -d ' ')B, $(links "$TMP/backup" | wc -l) -> $(links "$MEM" | wc -l) links"
