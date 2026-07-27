@@ -106,6 +106,18 @@ BACKUP="$TMP/MEMORY.md.backup"; cp "$MEM" "$BACKUP"
   echo "5. Keep an index entry whose file is absent - it may exist on the other machine and not be synced here yet."
   echo "6. Preserve the title line and any preamble at the top of the file."
   echo
+  echo "STYLE - ABSOLUTELY NO AI SLOP. This is a personal engineering notebook, not output:"
+  echo "* NO emojis. Not one, anywhere, ever."
+  echo "* NO attribution or self-reference: never 'generated', 'auto-added', 'updated by',"
+  echo "  'AI', 'Claude', or any note that a model touched this file. Mentions of Claude as"
+  echo "  a SUBJECT (claude-sync, CLAUDE.md) are fine - it is authorship that is banned."
+  echo "* NO filler or marketing register: no 'comprehensive', 'seamless', 'robust',"
+  echo "  'leverage', 'delve', 'powerful', 'streamlined', 'in the world of', 'it's worth"
+  echo "  noting', 'designed to'. No hedging."
+  echo "* Hooks state the concrete fact a future session needs - the gotcha, the exact flag,"
+  echo "  the path, the number. Terse and specific beats descriptive. Match the voice of the"
+  echo "  entries already there; they are the style guide."
+  echo
   echo "=== AUTHORITATIVE FILE LIST (filename<TAB>description) ==="
   inventory
   echo
