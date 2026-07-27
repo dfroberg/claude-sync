@@ -101,6 +101,8 @@ BACKUP="$TMP/MEMORY.md.backup"; cp "$MEM" "$BACKUP"
   echo "2. Every file in AUTHORITATIVE FILE LIST must appear exactly once."
   echo "3. Add a missing entry to the ## section that best fits its subject. Only if none fits, use '## Unfiled'."
   echo "4. For a new entry, write a concise hook from its description. Keep existing hooks verbatim."
+  echo "4a. Match the house format exactly: '- [Human Readable Title](file.md) — hook'."
+  echo "    The title is prose, NEVER the filename, and the separator is an em dash, not a hyphen."
   echo "5. Keep an index entry whose file is absent - it may exist on the other machine and not be synced here yet."
   echo "6. Preserve the title line and any preamble at the top of the file."
   echo
