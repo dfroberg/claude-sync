@@ -26,12 +26,23 @@
 #     cannot recurse.
 set -uo pipefail
 
-DIR="${1:-}"
-PREV="${2:-}"
-[ -d "$DIR" ] || { echo "usage: memory-reconcile <memory-dir> [previous-MEMORY.md]" >&2; exit 2; }
+FORCE=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in --force) FORCE=1 ;; *) ARGS+=("$a") ;; esac
+done
+DIR="${ARGS[0]:-}"
+PREV="${ARGS[1]:-}"
+[ -d "$DIR" ] || { echo "usage: memory-reconcile [--force] <memory-dir> [previous-MEMORY.md]" >&2; exit 2; }
 
 MEM="$DIR/MEMORY.md"
 MODEL="${CLAUDE_SYNC_RECONCILE_MODEL:-claude-sonnet-5}"
+LIMIT="${CLAUDE_SYNC_RECONCILE_TIMEOUT:-120}"
+# Above this, the index is not out of sync -- the project was simply never indexed. Bulk
+# indexing is a deliberate job, not something a background sync should quietly spend
+# minutes of subscription on. warroom-sync has 119 such files and blocked a push past five
+# minutes before this cap existed. Run with --force to do it on purpose.
+MAX_ORPHANS="${CLAUDE_SYNC_RECONCILE_MAX_ORPHANS:-25}"
 
 log(){ printf '[memory-reconcile] %s\n' "$*" >&2; }
 
@@ -60,8 +71,17 @@ if [ -z "$orphans" ] && [ -z "$prev_missing" ]; then
   exit 0
 fi
 
-[ -n "$orphans" ]      && log "$(basename "$DIR"): $(echo "$orphans" | wc -l | tr -d ' ') orphaned file(s)"
-[ -n "$prev_missing" ] && log "$(basename "$DIR"): $(echo "$prev_missing" | wc -l | tr -d ' ') entr(ies) present before the pull but not after"
+n_orphans=0; [ -n "$orphans" ] && n_orphans=$(echo "$orphans" | wc -l | tr -d ' ')
+proj=$(basename "$(dirname "$DIR")")
+[ -n "$orphans" ]      && log "$proj: $n_orphans orphaned file(s)"
+[ -n "$prev_missing" ] && log "$proj: $(echo "$prev_missing" | wc -l | tr -d ' ') entr(ies) present before the pull but not after"
+
+if [ "$FORCE" != "1" ] && [ "$n_orphans" -gt "$MAX_ORPHANS" ]; then
+  log "$proj: $n_orphans orphans exceeds $MAX_ORPHANS — this project was never indexed, which is"
+  log "$proj: a bulk job, not a sync repair. Skipping. To do it deliberately:"
+  log "$proj:   memory-reconcile --force '$DIR'"
+  exit 0
+fi
 
 command -v claude >/dev/null 2>&1 || { log "claude CLI not found; leaving index untouched"; exit 0; }
 
@@ -97,15 +117,29 @@ BACKUP="$TMP/MEMORY.md.backup"; cp "$MEM" "$BACKUP"
   fi
 } > "$TMP/prompt.txt"
 
-log "$(basename "$DIR"): merging via claude ($MODEL)"
+log "$proj: merging via claude ($MODEL)"
 # stdin MUST be closed explicitly. Invoked from a hook or a launchd agent, stdin is neither
 # a TTY nor EOF, so claude waits on it and gives up: "no stdin data received in 3s".
 # Interactively it worked, because stdin was a terminal -- the failure only appears where it
 # actually has to run.
-if ! CLAUDE_SYNC_RECONCILING=1 claude -p --model "$MODEL" \
-      --settings '{"disableAllHooks":true}' \
-      "$(cat "$TMP/prompt.txt")" > "$TMP/merged.md" 2>"$TMP/err.txt" </dev/null; then
-  log "claude failed; index left untouched. stderr: $(head -2 "$TMP/err.txt" | tr '\n' ' ')"
+# Bounded with a plain-bash watchdog rather than `timeout`: that binary lives in the nix
+# profile and is not reliably on a hook's PATH -- this repo already had to drop a
+# dependency on it once for that exact reason.
+CLAUDE_SYNC_RECONCILING=1 claude -p --model "$MODEL" \
+    --settings '{"disableAllHooks":true}' \
+    "$(cat "$TMP/prompt.txt")" > "$TMP/merged.md" 2>"$TMP/err.txt" </dev/null &
+cpid=$!
+( sleep "$LIMIT"; kill -TERM "$cpid" 2>/dev/null ) 2>/dev/null &
+wpid=$!
+wait "$cpid"; crc=$?
+kill -TERM "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+
+if [ "$crc" -ne 0 ]; then
+  if [ "$crc" -ge 124 ]; then
+    log "$proj: claude exceeded ${LIMIT}s and was killed; index left untouched"
+  else
+    log "$proj: claude failed (rc=$crc); index left untouched. stderr: $(head -2 "$TMP/err.txt" | tr '\n' ' ')"
+  fi
   exit 0
 fi
 
@@ -135,4 +169,4 @@ if [ -n "$fail" ]; then
 fi
 
 cp "$TMP/merged.md" "$MEM"
-log "$(basename "$DIR"): index reconciled ($(grep -cE '^- \[' "$BACKUP") -> $(grep -cE '^- \[' "$MEM") entries)"
+log "$proj: index reconciled ($(grep -cE '^- \[' "$BACKUP") -> $(grep -cE '^- \[' "$MEM") entries)"

@@ -36,9 +36,18 @@ RECONCILE="$REPO/bin/memory-reconcile"
 # overwrote. Never fatal: a broken index is worth fixing, never worth failing a sync over.
 reconcile_indexes(){
   [ -x "$RECONCILE" ] || return 0
+  [ "${CLAUDE_SYNC_NO_RECONCILE:-0}" = "1" ] && return 0
   snaps="${1:-}"
+  # Whole-pass budget. Each project is individually bounded, but 15 projects still add up,
+  # and sync is called from a SessionEnd hook with a 45s timeout of its own -- a slow
+  # reconcile must never be what stops memories being pushed.
+  deadline=$(( $(date +%s) + ${CLAUDE_SYNC_RECONCILE_BUDGET:-240} ))
   for m in "$CLAUDE"/projects/*/memory; do
     [ -d "$m" ] || continue
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "reconcile budget spent; remaining projects deferred to the next sync"
+      return 0
+    fi
     proj="$(basename "$(dirname "$m")")"
     prev=""
     [ -n "$snaps" ] && [ -f "$snaps/$proj/MEMORY.md" ] && prev="$snaps/$proj/MEMORY.md"
