@@ -70,7 +70,13 @@ is_text(){ case "$1" in *.md|*.json|*.jsonl|*.txt|*.sh|*.bash|*.zsh|*.lua|*.toml
 # Dannys-MacBook-Pro 2026-07-27, right after its first bootstrap.
 # git records only the exec bit, which is exactly the bit that matters here.
 file_mode(){ stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
-copy_mode(){ m=$(file_mode "$1"); [ -n "$m" ] && chmod "$m" "$2" 2>/dev/null || true; }
+# `local` is load-bearing. This was written as a bare `m=$(...)`, which collided with the
+# `for m in "$CLAUDE"/projects/*/memory` loop in collect(): the first file of each project
+# canonicalised correctly, copy_mode then overwrote m with "644", and every later
+# `rel="${p#"$m"/}"` stripped nothing -- so 30 of 31 files per project were written to
+# data/memory/<proj>/Users/dannyfroberg/.claude/projects/<proj>/memory/<file> instead of
+# data/memory/<proj>/<file>. Silent, and it corrupted the layout of every project.
+copy_mode(){ local m; m=$(file_mode "$1"); [ -n "$m" ] && chmod "$m" "$2" 2>/dev/null || true; }
 
 canon_file(){   if is_text "$1"; then sed "s|/Users/$ME/|/Users/$TOKEN/|g; s|-Users-$ME-|-Users-$TOKEN-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; copy_mode "$1" "$2"; }
 decanon_file(){ if is_text "$1"; then sed "s|/Users/$TOKEN/|/Users/$ME/|g; s|-Users-$TOKEN-|-Users-$ME-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; copy_mode "$1" "$2"; }
