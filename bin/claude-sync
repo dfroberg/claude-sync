@@ -69,7 +69,13 @@ is_text(){ case "$1" in *.md|*.json|*.jsonl|*.txt|*.sh|*.bash|*.zsh|*.lua|*.toml
 # first time got 644 and every hook died with "Permission denied". Seen on
 # Dannys-MacBook-Pro 2026-07-27, right after its first bootstrap.
 # git records only the exec bit, which is exactly the bit that matters here.
-file_mode(){ stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+# GNU first. With GNU coreutils `stat` on PATH (nix home-manager: /etc/profiles/per-user/*/bin),
+# `stat -f` is *filesystem* mode: it prints "  File: ..." for the real operand, exits 1 because
+# the format string was taken as a second (missing) file, and the `||` fallback then ALSO runs --
+# so the caller gets the filesystem block plus the mode. BSD `stat -c` fails cleanly with no
+# stdout, so GNU-first is correct on both. Observed 2026-08-26: line 91 died with
+# "File: unbound variable" on every run since 2026-07-27 and file_mode silently returned garbage.
+file_mode(){ stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
 # `local` is load-bearing. This was written as a bare `m=$(...)`, which collided with the
 # `for m in "$CLAUDE"/projects/*/memory` loop in collect(): the first file of each project
 # canonicalised correctly, copy_mode then overwrote m with "644", and every later
@@ -88,7 +94,7 @@ decanon_file(){ if is_text "$1"; then sed "s|/Users/$TOKEN/|/Users/$ME/|g; s|-Us
 # than the longest plausible run is treated as abandoned rather than trusted.
 acquire_lock(){
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    age=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+    age=$(( $(date +%s) - $(stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null || echo 0) ))
     if [ "$age" -gt "${CLAUDE_SYNC_LOCK_STALE:-900}" ]; then
       log "breaking stale lock (${age}s old; a previous run was killed)"
       rmdir "$LOCKDIR" 2>/dev/null
