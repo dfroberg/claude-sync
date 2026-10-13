@@ -156,7 +156,9 @@ collect(){
     done < <(find "$m" -type f -print0)
   done
   # Prune: anything in data/ this run did not produce is gone locally (or a leftover temp).
-  find "$DATA" -type f | grep -vxF -f "$MANIFEST" | while IFS= read -r stale; do rm -f "$stale"; done
+  # `|| true`: grep exits 1 when nothing is stale, which under pipefail + errexit killed the
+  # whole run silently on the first two test pushes.
+  find "$DATA" -type f | { grep -vxF -f "$MANIFEST" || true; } | while IFS= read -r stale; do rm -f "$stale"; done
   find "$DATA" -mindepth 1 -type d -empty -delete
   rm -f "$MANIFEST"
 }
