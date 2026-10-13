@@ -186,6 +186,9 @@ collect(){
 
 # data/ -> ~/.claude (decanonicalized). Additive merge — never deletes local files.
 apply(){
+  # Temp files a killed earlier apply left beside their targets (seen 2026-10-13). collect
+  # already ignores them; this keeps them from piling up in ~/.claude.
+  find "$CLAUDE"/projects/*/memory "${DIRS[@]/#/$CLAUDE/}" -name '*.sync-tmp.*' -type f -delete 2>/dev/null || true
   for f in "${FILES[@]}"; do
     [ -f "$DATA/$f" ] || continue
     ensure_dir "$CLAUDE/$(dirname "$f")"; decanon_file "$DATA/$f" "$CLAUDE/$f"
