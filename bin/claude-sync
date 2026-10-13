@@ -13,6 +13,15 @@
 set -euo pipefail
 
 REPO="${CLAUDE_SYNC_REPO:-$HOME/.claude-sync}"
+# launchd hands the push agent a bare PATH (/usr/bin:/bin:...). Apple git then runs the
+# global git-lfs pre-push hook (core.hookspath) and cannot find git-lfs, which lives in the
+# nix per-user profile, so every timer push failed with "failed to push some refs" -- 7
+# pushes succeeded against 14952 failures in the log before this line. Same git, same
+# ssh, same git-crypt as an interactive shell, whoever starts us.
+for _p in "/etc/profiles/per-user/$(id -un)/bin" "$HOME/.nix-profile/bin" /run/current-system/sw/bin /opt/homebrew/bin; do
+  [ -d "$_p" ] && case ":$PATH:" in *":$_p:"*) ;; *) PATH="$_p:$PATH";; esac
+done
+export PATH
 CLAUDE="$HOME/.claude"
 DATA="$REPO/data"
 TOKEN="__USER__"
@@ -210,7 +219,7 @@ sync_pull(){
   git -C "$REPO" clean -qfd -- data 2>/dev/null || true
   local out
   if out=$(git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>&1); then return 0; fi
-  log "pull failed: $(printf '%s' "$out" | grep -v '^hint:' | tail -3 | tr '\n' ' ')"
+  log "pull failed: $(printf '%s' "$out" | grep -v '^hint:' | tail -4 | tr '\n' ' ')"
   return 1
 }
 
@@ -281,7 +290,7 @@ cmd_push(){
   else
     # Propagate the failure. The old `push && log || log` always evaluated to 0, so the
     # timer wrapper's "re-flag and retry" branch was unreachable dead code.
-    log "push failed — $ahead commit(s) queued locally: $(printf '%s' "$out" | grep -v '^hint:' | tail -2 | tr '\n' ' ')"
+    log "push failed — $ahead commit(s) queued locally: $(printf '%s' "$out" | grep -v '^hint:' | tail -4 | tr '\n' ' ')"
     return 1
   fi
 }
