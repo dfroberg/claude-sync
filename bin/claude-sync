@@ -102,9 +102,14 @@ copy_mode(){ local m; m=$(file_mode "$1"); [ -n "$m" ] && chmod "$m" "$2" 2>/dev
 # An EMPTY source never replaces a non-empty target: a 0-byte memory is a truncation, not
 # an edit, and syncing it only spreads the damage to the other machine.
 xform_file(){  # src dst from-user to-user
-  local dst="$2" tmp
-  [ -L "$dst" ] && dst="$(readlink -f "$dst")"      # rename must land on the target, not replace the link
-  [ -d "$dst" ] && rm -rf "$dst"                    # the source became a file where a directory stood
+  local dst="$2" tmp was_link=0
+  [ -L "$dst" ] && { was_link=1; dst="$(readlink -f "$dst")"; }   # rename must land on the target, not replace the link
+  if [ -d "$dst" ]; then                             # the source became a file where a directory stood
+    if [ "$was_link" = 1 ] || [ -n "$(ls -A "$dst")" ]; then
+      log "refusing to replace directory ${dst#"$HOME"/} with a file"; return 0   # never delete local content
+    fi
+    rmdir "$dst"
+  fi
   tmp="$dst.sync-tmp.$$"
   if is_text "$1"; then sed "s|/Users/$3/|/Users/$4/|g; s|-Users-$3-|-Users-$4-|g" "$1" >"$tmp"; else cp -p "$1" "$tmp"; fi
   if [ ! -s "$tmp" ] && [ -s "$dst" ]; then
@@ -120,7 +125,16 @@ xform_file(){  # src dst from-user to-user
 }
 # A path that must be a directory; a stale regular file of that name (the source turned
 # into a directory) would make `mkdir -p` fail and errexit abort every later run.
-ensure_dir(){ [ -d "$1" ] || { [ -e "$1" ] && rm -f "$1"; mkdir -p "$1"; }; }
+ensure_dir(){
+  [ -d "$1" ] && return 0
+  mkdir -p "$1" 2>/dev/null && return 0
+  local a="$1"                                     # some ancestor is a stale regular file (ENOTDIR)
+  while [ "$a" != / ] && [ "$a" != . ]; do
+    if [ -e "$a" ] && [ ! -d "$a" ]; then rm -f "$a"; break; fi
+    a="$(dirname "$a")"
+  done
+  mkdir -p "$1"
+}
 canon_file(){   xform_file "$1" "$2" "$ME" "$TOKEN"; }
 decanon_file(){ xform_file "$1" "$2" "$TOKEN" "$ME"; }
 
