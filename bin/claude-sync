@@ -84,8 +84,25 @@ file_mode(){ stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
 # data/memory/<proj>/<file>. Silent, and it corrupted the layout of every project.
 copy_mode(){ local m; m=$(file_mode "$1"); [ -n "$m" ] && chmod "$m" "$2" 2>/dev/null || true; }
 
-canon_file(){   if is_text "$1"; then sed "s|/Users/$ME/|/Users/$TOKEN/|g; s|-Users-$ME-|-Users-$TOKEN-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; copy_mode "$1" "$2"; }
-decanon_file(){ if is_text "$1"; then sed "s|/Users/$TOKEN/|/Users/$ME/|g; s|-Users-$TOKEN-|-Users-$ME-|g" "$1" >"$2"; else cp -p "$1" "$2"; fi; copy_mode "$1" "$2"; }
+# Atomic, content-aware copy. Writes a sibling temp file and renames it into place, so a
+# kill mid-run (the hooks SIGTERM us at their timeout) can never leave a truncated target.
+# The previous `sed > target` truncated BEFORE writing: 19 memory files were found at 0
+# bytes on 2026-10-08 and 27 more on 2026-10-13, every one killed between the two steps.
+# Unchanged content is left alone, so mtimes stay put and git-crypt's clean filter runs
+# only on files that really changed (it ran on all 1060 before, ~33s of every push).
+# An EMPTY source never replaces a non-empty target: a 0-byte memory is a truncation, not
+# an edit, and syncing it only spreads the damage to the other machine.
+xform_file(){  # src dst from-user to-user
+  local tmp="$2.sync-tmp.$$"
+  if is_text "$1"; then sed "s|/Users/$3/|/Users/$4/|g; s|-Users-$3-|-Users-$4-|g" "$1" >"$tmp"; else cp -p "$1" "$tmp"; fi
+  if [ ! -s "$tmp" ] && [ -s "$2" ]; then
+    log "refusing to replace non-empty ${2#"$HOME"/} with an empty source"; rm -f "$tmp"; return 0
+  fi
+  if [ -f "$2" ] && cmp -s "$tmp" "$2"; then rm -f "$tmp"; return 0; fi
+  copy_mode "$1" "$tmp"; mv -f "$tmp" "$2"
+}
+canon_file(){   xform_file "$1" "$2" "$ME" "$TOKEN"; }
+decanon_file(){ xform_file "$1" "$2" "$TOKEN" "$ME"; }
 
 # The EXIT trap releases the lock on a normal exit or a SIGTERM, but NOT on SIGKILL -- and a
 # run killed by a caller's timeout is exactly when that happens. The leftover directory then
@@ -95,7 +112,7 @@ decanon_file(){ if is_text "$1"; then sed "s|/Users/$TOKEN/|/Users/$ME/|g; s|-Us
 acquire_lock(){
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
     age=$(( $(date +%s) - $(stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null || echo 0) ))
-    if [ "$age" -gt "${CLAUDE_SYNC_LOCK_STALE:-900}" ]; then
+    if [ "$age" -gt "${CLAUDE_SYNC_LOCK_STALE:-300}" ]; then
       log "breaking stale lock (${age}s old; a previous run was killed)"
       rmdir "$LOCKDIR" 2>/dev/null
       mkdir "$LOCKDIR" 2>/dev/null || { log "another sync is running; skipping"; exit 0; }
@@ -103,20 +120,30 @@ acquire_lock(){
       log "another sync is running; skipping"; exit 0
     fi
   fi
+  # bash runs the EXIT trap on a normal exit but NOT when an untrapped signal kills it, and
+  # the hooks kill us with SIGTERM at their timeout: 54 "another sync is running" skips in
+  # five days (2026-10-08..13) were all this. Trap the signals so the lock goes with us.
   trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+  trap 'rmdir "$LOCKDIR" 2>/dev/null; exit 143' TERM INT HUP
 }
 
-# ~/.claude -> data/ (canonicalized). Rebuilds data/ from scratch each time.
+# ~/.claude -> data/ (canonicalized). Writes only what changed, then prunes whatever no
+# longer exists locally. It used to `rm -rf data/` first, which rewrote all 1060 files so
+# git-crypt re-encrypted every one on `git add`, and left data/ half-built whenever a hook
+# timeout killed the run -- the half-built tree is what `pull --autostash` then stashed
+# and wedged on (27 Aug and 10 Oct 2026).
 collect(){
-  rm -rf "$DATA"; mkdir -p "$DATA"
+  mkdir -p "$DATA"
+  MANIFEST=$(mktemp)
+  keep(){ printf '%s\n' "$1" >>"$MANIFEST"; }
   for f in "${FILES[@]}"; do
     [ -f "$CLAUDE/$f" ] || continue
-    mkdir -p "$DATA/$(dirname "$f")"; canon_file "$CLAUDE/$f" "$DATA/$f"
+    mkdir -p "$DATA/$(dirname "$f")"; canon_file "$CLAUDE/$f" "$DATA/$f"; keep "$DATA/$f"
   done
   for d in "${DIRS[@]}"; do
     [ -d "$CLAUDE/$d" ] || continue
     while IFS= read -r -d '' p; do
-      rel="${p#"$CLAUDE"/}"; mkdir -p "$DATA/$(dirname "$rel")"; canon_file "$p" "$DATA/$rel"
+      rel="${p#"$CLAUDE"/}"; mkdir -p "$DATA/$(dirname "$rel")"; canon_file "$p" "$DATA/$rel"; keep "$DATA/$rel"
     done < <(find "$CLAUDE/$d" -type f -print0)
   done
   # memories: ~/.claude/projects/<proj>/memory/**  ->  data/memory/<canonical-proj>/**
@@ -125,9 +152,13 @@ collect(){
     proj="$(basename "$(dirname "$m")")"
     cproj="${proj//-Users-$ME-/-Users-$TOKEN-}"
     while IFS= read -r -d '' p; do
-      rel="${p#"$m"/}"; mkdir -p "$DATA/memory/$cproj/$(dirname "$rel")"; canon_file "$p" "$DATA/memory/$cproj/$rel"
+      rel="${p#"$m"/}"; mkdir -p "$DATA/memory/$cproj/$(dirname "$rel")"; canon_file "$p" "$DATA/memory/$cproj/$rel"; keep "$DATA/memory/$cproj/$rel"
     done < <(find "$m" -type f -print0)
   done
+  # Prune: anything in data/ this run did not produce is gone locally (or a leftover temp).
+  find "$DATA" -type f | grep -vxF -f "$MANIFEST" | while IFS= read -r stale; do rm -f "$stale"; done
+  find "$DATA" -mindepth 1 -type d -empty -delete
+  rm -f "$MANIFEST"
 }
 
 # data/ -> ~/.claude (decanonicalized). Additive merge — never deletes local files.
@@ -155,6 +186,32 @@ apply(){
 
 git_repo(){ [ -d "$REPO/.git" ] || die "no git repo at $REPO (bootstrap it first)"; }
 
+# A rebase-merge directory without `head-name` is not a rebase in progress: it is what a
+# `pull --rebase --autostash` leaves when killed between stashing and rebasing. git then
+# refuses every later pull ("already a rebase-merge directory"), and with stderr discarded
+# that read as "offline" -- for five weeks (27 Aug to 8 Oct 2026, 2493 commits stuck) and
+# again 10 to 13 Oct (404). The autostash it holds is derived data/, rebuilt by collect.
+clear_dead_rebase(){
+  local d="$REPO/.git/rebase-merge"
+  if [ -d "$d" ] && [ ! -f "$d/head-name" ]; then
+    log "removing dead rebase-merge dir left by a killed run"; rm -rf "$d"
+  fi
+  return 0
+}
+
+# data/ is derived state, so reset it to HEAD before pulling: then --autostash has nothing
+# to stash and a kill mid-pull cannot wedge the repo. git's stderr goes to the log -- the
+# old `2>/dev/null || log "offline"` is how both wedges stayed invisible.
+sync_pull(){
+  clear_dead_rebase
+  git -C "$REPO" checkout -q -- data 2>/dev/null || true
+  git -C "$REPO" clean -qfd -- data 2>/dev/null || true
+  local out
+  if out=$(git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>&1); then return 0; fi
+  log "pull failed: $(printf '%s' "$out" | grep -v '^hint:' | tail -3 | tr '\n' ' ')"
+  return 1
+}
+
 # Auto-unlock git-crypt on a fresh clone: if data/ is still ciphertext and the
 # sops-decrypted key exists (placed by dotnix decryptSecrets), unlock non-interactively.
 KEYFILE="${CLAUDE_SYNC_KEY:-$HOME/.config/git-crypt/claude-sync.key}"
@@ -171,7 +228,7 @@ ensure_unlocked(){
 
 cmd_push(){
   acquire_lock; git_repo
-  git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || log "pull skipped (offline / no upstream yet)"
+  sync_pull || log "continuing without a pull; the push below will say if the remote moved"
   ensure_unlocked
 
   # Fold in any orphans before collect, so the index this machine publishes is already
@@ -217,19 +274,19 @@ cmd_push(){
   ahead=$(git -C "$REPO" rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
   if [ "$ahead" -eq 0 ]; then log "up to date"; return 0; fi
 
-  if git -C "$REPO" push -q origin "$BRANCH" 2>/dev/null; then
+  if out=$(git -C "$REPO" push -q origin "$BRANCH" 2>&1); then
     log "pushed ($ahead commit(s))"
   else
     # Propagate the failure. The old `push && log || log` always evaluated to 0, so the
     # timer wrapper's "re-flag and retry" branch was unreachable dead code.
-    log "push failed (offline?) — $ahead commit(s) queued locally"
+    log "push failed — $ahead commit(s) queued locally: $(printf '%s' "$out" | grep -v '^hint:' | tail -2 | tr '\n' ' ')"
     return 1
   fi
 }
 
 cmd_pull(){
   acquire_lock; git_repo
-  git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>/dev/null || { log "pull skipped (offline?)"; return 0; }
+  sync_pull || { log "pull skipped"; return 0; }
   ensure_unlocked
 
   # Snapshot every MEMORY.md BEFORE apply overwrites it. apply is additive for memory
