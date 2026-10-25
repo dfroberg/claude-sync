@@ -139,8 +139,9 @@ Unchanged from today:
 All comparisons below are on canonical bytes plus the exec bit: local content is
 canonicalised before it is compared with repo content, and a file whose bytes match but
 whose exec bit differs counts as changed. A chmod-only change is therefore pulled (chmod
-locally) and pushed (chmod in `data/`) like any other change. The rewrite is lossy in the same rare cases as today (a file
-that already contains the literal `__USER__` token); that is accepted, not fixed.
+locally) and pushed (chmod in `data/`) like any other change. The rewrite is lossy in
+the same rare cases as today (a file that already contains the literal `__USER__`
+token); that is accepted, not fixed.
 
 ### 6.4 State: the base
 
@@ -261,7 +262,9 @@ the filter does not run (verified, see 6.7 step 7).
    leave the skipped deletions unreachable and let the next push undo them on the remote.
 7. Read contents for the changed paths only. `L` = canonical local content (absent if no
    file). `B` = decrypted content at `M`: read from the `data/` work tree when `M` is the
-   base, because the invariant guarantees it holds the decrypted base tree. `R`, and `B`
+   base, because the invariant guarantees it holds the decrypted base tree. Every path
+   into these steps must therefore start from a restored invariant, including a push
+   retry (6.10 step 8). `R`, and `B`
    when `M` is not the base, come from a temporary checkout of those paths into a private
    temporary directory with a temporary index:
    `GIT_ATTR_SOURCE=<rev> GIT_INDEX_FILE=<tmp index> git --work-tree=<tmp dir> checkout <rev> --pathspec-from-file=- --pathspec-file-nul`.
@@ -274,12 +277,17 @@ the filter does not run (verified, see 6.7 step 7).
      filter changes the length, as git-crypt decryption does. Do not use it.
    - Without `GIT_ATTR_SOURCE`, a temporary work tree has no `.gitattributes`, and the
      filter silently does not run.
-8. For each changed path, decide by the table in 6.8. Each path is handled on its own: a
-   filesystem error on one path (for example a remote file where a local directory of
-   that name sits, or a permission error) turns that path into a keep-both (the remote
-   copy goes to `conflicts/`; if even that fails, an ERROR line names the path), and the
-   run continues with the next path. Git failures and the ciphertext guard still stop the
-   whole run.
+8. For each changed path, decide by the table in 6.8. Deletions are applied before
+   writes, so a file replaced by a directory of the same name, or the reverse, lands
+   cleanly. A type clash on one path (`EISDIR` or `ENOTDIR`: a local directory where the
+   remote has a file, or a local file where the remote needs a directory) turns that path
+   into a keep-both (the remote copy goes to `conflicts/`; if even that fails, an ERROR
+   line names the path), and the run continues with the next path. Any other filesystem
+   error (disk full, permission denied, read-only file) stops the run with an ERROR naming
+   the path, before the reset and the update-ref, so the base does not move and the next
+   run retries; paths already written are then skipped as `L == R`. Parking such a path
+   and advancing the base would let the next push send the stale local copy over the other
+   Mac's edit. Git failures and the ciphertext guard also stop the whole run.
 9. `git reset -q --hard O`. This also brings in new code under `bin/` and `claude_sync/`;
    that is the self-update. Then `git update-ref refs/claude-sync/base O`, and remove
    `.fresh-machine` if present.
@@ -307,7 +315,9 @@ Equality means the same canonical bytes and the same exec bit.
 
 When only the exec bit differs between `L` and `R`, the bit follows its own three-way
 rule: if `L`'s bit equals `B`'s, take `R`'s (chmod); otherwise keep `L`'s. A merged
-result gets its exec bit by the same rule.
+result gets its exec bit by the same rule. With no `B` (added on both sides, including a
+first pull), keep `L`'s bit, except on a machine marked `.fresh-machine`, where `R`'s bit
+is taken, matching which side keeps the place in 6.4.
 
 Race guard: just before replacing a local file, re-stat it; if size or mtime moved since
 `L` was read, re-read and decide again (at most 3 times, then treat as a conflict). This
@@ -329,6 +339,9 @@ narrows the window where a session's write lands between the read and the rename
   `$REPO/conflicts/<UTC timestamp>/<path relative to ~/.claude>`. Logged as WARN and
   reported on stdout. Because the base then advances, the local version wins on the next
   push, and the remote version is preserved in git history as well as in `conflicts/`.
+  For a type clash (6.7 step 8) the local side is a directory, so the next push sends the
+  directory's files and a delete of the remote file, which the other Mac moves to trash
+  by the 6.8 table.
 - Added on both sides (no `B` for the path, which includes every differing path in a
   first pull): merge against an empty base by the same rules. Verified with
   `git merge-file`: git narrows the conflict, so lines both sides share are kept once and
@@ -362,10 +375,15 @@ narrows the window where a session's write lands between the read and the rename
    `*.sync-tmp.*`), set their exec bit, delete removed ones, `git add -A -- data`, commit
    `sync: <ME>@<LocalHostName> <UTC time>` on top of `HEAD` (which is `O`).
 8. `git update-ref refs/claude-sync/pending HEAD`, then `git push -q origin HEAD:<BRANCH>`
-   with a 30 s timeout. Rejected because the remote moved: go back to step 4, at most 3
-   attempts in total, then ERROR. Offline or timed out: WARN, exit 0. The next run either
-   finds the push landed (pending check in 6.4, base moves to it) or drops the commit in
-   its invariant restore and rebuilds it from `~/.claude`.
+   with a 30 s timeout. Rejected because the remote moved: first restore the invariant
+   (`git reset -q --hard base`, `git clean -qfdx -- data`) and delete pending, then go
+   back to step 4, at most 3 attempts in total, then ERROR. The restore is required, not
+   tidying: step 7 wrote the local versions into `data/`, and the pull steps read `B` from
+   `data/` (6.7 step 7), so without it a local edit would read as unchanged and be
+   overwritten by the remote version with no merge and no copy. Offline or timed out:
+   WARN, exit 0. The next run either finds the push landed (pending check in 6.4, base
+   moves to it) or drops the commit in its invariant restore and rebuilds it from
+   `~/.claude`.
 9. On success, `git update-ref refs/claude-sync/base HEAD` and delete pending.
 
 History stays linear: every commit's parent is the remote tip it was built on. No rebase,
@@ -536,11 +554,16 @@ Required cases:
     `~/.claude`; content with the git-crypt header is never written locally.
 23. Retention: `conflicts/` and `trash/` folders older than 30 days are removed, newer
     ones kept.
-24. One bad path: the remote adds a file where a local directory of that name sits. That
-    path becomes a keep-both, the other changed paths are applied, the base advances, and
-    the next pull runs clean.
+24. One bad path. Type clash: the remote adds a file where a local directory of that name
+    sits. That path becomes a keep-both, the other changed paths are applied, the base
+    advances, and the next pull runs clean; the next push sends the directory, and the
+    other machine moves its file to trash. Other error: a write fails for another reason
+    (for example a read-only target directory). The run stops with an ERROR naming the
+    path, the base does not move, nothing is parked, and once the cause is removed the
+    next pull completes with no edit lost on either machine.
 25. Exec bit: a chmod-only change on either machine reaches the other; a merge keeps the
-    bit by the rule in 6.8.
+    bit by the rule in 6.8; with no base, a both-sides bit difference keeps the local bit,
+    or the remote bit on a `.fresh-machine` Mac.
 26. Leftovers: an untracked file and a `*.sync-tmp.*` file left in `data/` by a killed run
     are removed by the next run and never committed.
 27. Push landed but unseen: the remote has this machine's commit, pending is set, and the
@@ -550,17 +573,31 @@ Required cases:
     stays removed, the addition is kept, and there is no keep-both.
 29. Stale tracking ref: `origin/<BRANCH>` is rewound by hand in the clone; the next pull
     still sees the remote tip.
+30. Rejected push: machine A has a local edit to a file and is pushing; machine B pushes a
+    change to the same file after A's fetch and before A's push lands, so A's push is
+    rejected. A's edit is not overwritten: the result is a clean merge, or a keep-both
+    with the stdout notice. A second variant where B changed a different file ends with
+    both changes on the remote and on both machines.
 
 ## 9. Rollout (each step needs the owner's yes)
 
 Code first, nix second, never the other way round (section 7).
 
 1. Review the branch `dfroberg/TO-772-claude-sync-rewrite`.
-2. On each Mac, run the old `claude-sync push` once, right before step 3, so local and
-   remote agree. Anything that still differs on both sides at the first new-code run has
-   no base to merge against: the local copy stays and the remote copy goes to
-   `conflicts/` (6.4). The last old-code pull, which brings in the new code, still runs
-   the old `apply()` once.
+2. Run the old `claude-sync push` once on the main Mac (EZ-MBP-GD4RPHKWL4) only, right
+   before step 3, so its local files and the remote agree. Anything that still differs
+   on both sides at its first new-code run has no base to merge against: the local copy
+   stays and the remote copy goes to `conflicts/` (6.4). The last old-code pull, which
+   brings in the new code, still runs the old `apply()` once.
+   Do not run the old push on the second Mac (Dannys-MacBook-Pro, 5 of the 3596 sync
+   commits): the old push never applies, so it would send that Mac's stale copies over
+   the main Mac's (section 2 item 2). Its 5 minute timer runs the old push only when
+   `~/.claude-sync/.dirty` exists, so before step 3 remove that file there, or keep that
+   Mac asleep with no Claude session, until its step 4. Its next session start then runs
+   the old pull one last time, which applies the remote over its local files as the old
+   code always has, and brings in the new code; its first new-code run finds local equal
+   to the remote. If it holds local work that must survive, copy that work aside before
+   that session start.
 3. Merge the branch into `main` of `dfroberg/claude-sync` and push. This touches only
    `bin/`, `claude_sync/`, `tests/`, `docs/`, `README.md` (new-machine steps gain the
    `touch .fresh-machine` line) and `.gitignore`; `data/` is not changed.
@@ -585,6 +622,8 @@ and `.fresh-machine`.
 - Whether to add a stat cache to the scan. Only if test 15 misses its budget.
 - How the fixture for test 15 is generated.
 - Exact kill points for test 14.
+- How tests 27 and 30 force their race (for example setting the refs directly for 27, and
+  a `pre-push` hook in A's test clone that first pushes from B for 30).
 
 ## 11. Calls made by the lead, for the owner to check
 
@@ -609,7 +648,12 @@ and `.fresh-machine`.
   `settings.json` over the real one or parks a migrating Mac's pending edits.
 - A remote mass delete stops all syncing on that Mac, loudly, until the remote is fixed or
   the override is run.
-- A path that cannot be written becomes a keep-both; it no longer fails the whole run.
+- A path where a directory sits in the way of a file, or the reverse, becomes a keep-both
+  and the run continues. Any other write failure stops the run before the base moves, so
+  it is retried and stays loud instead of being parked.
+- Rollout: the old push runs on the main Mac only. The second Mac takes the new code
+  through one last old pull, which overwrites its local files with the remote as the old
+  code always has.
 
 ## 12. Adversarial review
 
@@ -625,7 +669,7 @@ small git experiments in a scratch directory. Verdict: NEEDS FIXES (1 critical, 
 | 2 | Major | The base cannot be the empty tree: `reset`, `merge-base` and `--is-ancestor` fail on a tree. | 6.4: the base is a commit or absent; the empty tree is used only as a diff side. |
 | 3 | Major | `git cat-file --batch --filters` rejects `<rev>:<path>`, and without the filter it returns ciphertext silently. | 6.7 step 7: temporary checkout with `GIT_ATTR_SOURCE`. While verifying, a further problem was found: with `<blob> <path>` input the batch header gives the size before filtering, so the stream cannot be split once git-crypt changes the length. `cat-file --batch --filters` is not used at all. The ciphertext guard now also covers content read from git (6.6). Test 18. |
 | 4 | Major | The remote mass delete guard skipped deletions but still moved the base, so the deletions became unreachable and the next push undid them. | 6.7 step 6: stop before any write, reset or base move; push stops too. Test 9. |
-| 5 | Major | One path that cannot be written (a file where a directory sits) would fail every pull from then on. | 6.7 step 8: per-path handling; such a path becomes a keep-both and the run continues. Test 24. |
+| 5 | Major | One path that cannot be written (a file where a directory sits) would fail every pull from then on. | 6.7 step 8: a type clash becomes a keep-both and the run continues (narrowed by the re-check, new defect 2: any other error stops the run). Test 24. |
 | 6 | Major | The exec bit no longer travelled, because comparisons looked at bytes only. | 6.3, 6.8, 6.10: comparisons include the exec bit, with a three-way rule for the bit. Test 25. |
 | 7 | Major | `reset --hard` leaves untracked files in `data/`, which the next `git add -A` would commit. | 6.4: the restore also runs `git clean -qfdx -- data`; temporary files use `*.sync-tmp.*`, which is ignored. Test 26. |
 | 8 | Minor | An own push that landed but timed out would come back as remote changes and produce spurious keep-both conflicts. | 6.4 and 6.10: `refs/claude-sync/pending`, resolved after the next fetch. Test 27. |
@@ -645,3 +689,20 @@ Verification commands run by the lead for findings 1 and 3 (scratch repo, test f
 - `git merge-file -p --union` of two index files against an empty base kept the shared
   lines once and both added lines, exit 0. The same without `--union` conflicted only on
   the differing lines, exit 1.
+
+### Re-check of the fixes
+
+One Fable pass on the fixes only (the diff from e8f137e1 to bc22a81c), 2026-10-25. It
+confirmed all twelve findings resolved, and re-ran the temporary checkout experiment
+(filter ran with `GIT_ATTR_SOURCE`, mode 755 kept, real work tree untouched; without it,
+silent plaintext). It also checked and cleared: empty-tree `diff --raw` lists adds and
+modes correctly; a killed first pull is safe to repeat; pending survives the invariant
+restore; the remote mass delete guard cannot fire in a first pull. Verdict: NEEDS FIXES,
+for four new defects introduced by the fixes, all accepted:
+
+| # | Severity | Defect | Resolution |
+|---|---|---|---|
+| N1 | Critical | A rejected push went back to the pull steps with the local versions still written in `data/`. The pull reads `B` from `data/`, so a local edit read as unchanged and was overwritten by the remote version with no merge and no copy. | 6.10 step 8: restore the invariant and delete pending before every retry; 6.7 step 7 states that every entry into the pull steps starts from a restored invariant. Test 30. |
+| N2 | Major | Turning every filesystem error into a keep-both while the base advanced let a transient failure (disk full, read-only file) leave a stale local file that the next push sent over the other Mac's edit. | 6.7 step 8: keep-both only for a type clash (`EISDIR`, `ENOTDIR`); any other error stops the run before the base moves. 6.9 states what the next push does after a type clash. Test 24. |
+| N3 | Minor | The exec-bit rule had no answer with no `B` (added on both sides). | 6.8: keep `L`'s bit, or `R`'s on a `.fresh-machine` Mac. Test 25. |
+| N4 | Minor | Rollout step 2 ran the old push on both Macs, but the old push never applies, so the second Mac would push its stale copies over the main Mac's. | Section 9 step 2: the old push runs on the main Mac only; the second Mac takes the new code through one last old pull. The reviewer suggested ordering both pushes instead; not taken, because with two old pushes the later one still overwrites the remote with copies that Mac never applied. |
