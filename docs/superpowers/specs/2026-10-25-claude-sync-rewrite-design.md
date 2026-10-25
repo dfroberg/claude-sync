@@ -127,11 +127,16 @@ session still sees the problem.
 - `REPO` = `$CLAUDE_SYNC_REPO` or `$HOME/.claude-sync`. `DATA` = `$REPO/data`.
 - `ME` = `$CLAUDE_SYNC_USER` or the login name. The override exists for tests.
 - `BRANCH` = `$CLAUDE_SYNC_BRANCH` or `main`.
-- Every git command runs as `git -C $REPO`, with `GIT_DIR`, `GIT_WORK_TREE`,
-  `GIT_INDEX_FILE`, `GIT_PREFIX`, `GIT_OBJECT_DIRECTORY`,
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR` and `GIT_NAMESPACE` removed from its
-  environment: hooks start in the user's project, which is itself a git repo, and may
-  inherit them. Commands are argument lists, never shell strings.
+- Every git command runs as `git -C $REPO`, and git-crypt runs with `$REPO` as its working
+  directory, with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`,
+  `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`,
+  `GIT_NAMESPACE`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, every `GIT_CONFIG_KEY_*` and
+  `GIT_CONFIG_VALUE_*`, `GIT_ASKPASS` and `SSH_ASKPASS` removed from its environment: hooks
+  start in the user's project, which is itself a git repo, and may inherit them (a parent
+  `git -c` exports `GIT_CONFIG_PARAMETERS`, which could replace the git-crypt filters).
+  An inherited `GIT_SSH_COMMAND` is kept, as the user's own choice; without one, the tool
+  sets `ssh -o BatchMode=yes -o ConnectTimeout=10`. Commands are argument lists, never
+  shell strings.
 
 ### 6.3 What syncs and how paths are rewritten
 
@@ -386,7 +391,10 @@ is taken, matching which side keeps the place in 6.4.
 Race guard: just before replacing a local file or moving it to trash, re-stat it; if it
 appeared, disappeared, or its size or mtime moved since `L` was read, re-read it
 (canonicalised, like any `L`) and decide again. After 3 such attempts the path becomes a
-keep-both: the local file is left as it is and the remote version is parked. This narrows
+keep-both: the local file is left as it is and the remote version is parked. When the
+remote deleted the path there is nothing to park, so the local file is kept as a local
+edit beating a remote delete. Reads never follow a symlink, so a path that turns into
+one after the check stops the run instead of reading outside `~/.claude`. This narrows
 the window where a session's write lands between the read and the rename. If the scan of
 a later push reads a file in the middle of a session's write, that push may publish the
 partial content; the push after the write completes publishes the full file. This risk is
@@ -914,3 +922,17 @@ accepted in part and 2 rejected, with reasons below.
 | m10 | Minor | A new 0-byte file could be pushed. | Rejected: it has no base version to lose, so publishing an empty new file loses nothing; the guard exists for files that had content. |
 | m11 | Minor | The commit message and refspec must be argv. | Accepted. 6.2. |
 | m12 | Minor | Diff status `T` was not in the table. | Accepted. 6.3: a remote symlink or submodule entry stops the run with an ERROR. |
+
+### Round 2: re-check of the fixes
+
+One grok-4.7 pass on the fix diffs only (design 288695ef..9dd506fb and the plan), with the
+design as the oracle. Verdict: DO NOT EXECUTE (1 critical, 10 major, 5 minor), mostly about
+plan wording; the design changes it prompted:
+- 6.2: the environment clean-up also removes config injection (`GIT_CONFIG_PARAMETERS`,
+  `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`) and the askpass helpers,
+  and covers git-crypt. Not taken: always replacing an inherited `GIT_SSH_COMMAND`; it is
+  the user's own setting, and without `BatchMode` the worst case is a fetch that hits its
+  20 s timeout and is reported as offline.
+- 6.8: the race fallback for a remote delete keeps the local file (nothing to park), and
+  reads never follow a symlink.
+The plan's record lists every item and its resolution.
