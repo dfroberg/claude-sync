@@ -1,6 +1,8 @@
 # claude-sync rewrite: design (TO-772)
 
-Status: draft for owner approval, revised after the adversarial round (section 12).
+Status: approved by the owner on 2026-10-25, then revised after the grok-4.7 adversarial
+round (section 12). The changes that alter approved behaviour are listed at the end of
+section 11 for the owner to check.
 Date: 2026-10-25. Jira: TO-772.
 
 ## 1. Intent
@@ -102,13 +104,17 @@ bin/memory-lint          unchanged
 bin/memory-index-orphans unchanged
 ```
 
-The shim keeps the existing PATH loop, sets `PYTHONDONTWRITEBYTECODE=1`, and picks the
-first working interpreter of: `/etc/profiles/per-user/$USER/bin/python3`,
-`$HOME/.nix-profile/bin/python3`, `/run/current-system/sw/bin/python3`,
-`/opt/homebrew/bin/python3`, then `/usr/bin/python3` only if `xcode-select -p` succeeds
-(otherwise that stub opens an install dialog). It requires 3.9 or newer. With none found it
-writes a timestamped ERROR to the log, prints the one-line notice from 6.11 to stdout, and
-exits 0, so a hook never breaks a session but the session still sees the problem.
+The shim keeps the existing PATH loop, changes to the repo root it lives in, and runs
+`python3 -E -s -B -m claude_sync` there: the package is not installed anywhere, `-m`
+would otherwise put the hook's project directory first on `sys.path` (a `json.py` there
+would shadow the standard library), `-E` ignores `PYTHONPATH`, and `-B` stops bytecode
+files. It uses the first candidate that exists and reports Python 3.9 or newer, trying in
+order: `/etc/profiles/per-user/$USER/bin/python3`, `$HOME/.nix-profile/bin/python3`,
+`/run/current-system/sw/bin/python3`, `/opt/homebrew/bin/python3`, then `/usr/bin/python3`
+only if `xcode-select -p` succeeds (otherwise that stub opens an install dialog). With none
+found it appends a timestamped ERROR to `last-sync.log` in the repo root, prints the
+one-line notice from 6.11 to stdout, and exits 0, so a hook never breaks a session but the
+session still sees the problem.
 
 `.gitignore` gains: `.sync.lock`, `.fresh-machine`, `conflicts/`, `trash/`, `__pycache__/`,
 `*.sync-tmp.*`.
@@ -121,6 +127,11 @@ exits 0, so a hook never breaks a session but the session still sees the problem
 - `REPO` = `$CLAUDE_SYNC_REPO` or `$HOME/.claude-sync`. `DATA` = `$REPO/data`.
 - `ME` = `$CLAUDE_SYNC_USER` or the login name. The override exists for tests.
 - `BRANCH` = `$CLAUDE_SYNC_BRANCH` or `main`.
+- Every git command runs as `git -C $REPO`, with `GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE`, `GIT_PREFIX`, `GIT_OBJECT_DIRECTORY`,
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR` and `GIT_NAMESPACE` removed from its
+  environment: hooks start in the user's project, which is itself a git repo, and may
+  inherit them. Commands are argument lists, never shell strings.
 
 ### 6.3 What syncs and how paths are rewritten
 
@@ -128,13 +139,29 @@ Unchanged from today:
 - Files `CLAUDE.md`, `settings.json`, `mcp_settings.json`, `keybindings.json`; trees
   `skills/`, `agents/`, `commands/`, `hooks/`; and `projects/<proj>/memory/**` stored as
   `data/memory/<canonical proj>/**`.
-- Regular files only; symlinked files are not collected. Writing into a local path that
-  is a symlink writes its target. Files named `*.sync-tmp.*` are ignored.
+- Regular files only. A local path that is a symlink, or passes through a symlinked
+  directory, is outside the sync on this machine in both directions: never collected,
+  never counted as a local delete, and never read, written or trashed by pull (one INFO
+  line per run gives the count). Pull therefore never writes outside `~/.claude`. Today
+  none of the four top-level files is a symlink, and three skill folders are (Orca's,
+  linked into `~/.agents/skills`, not in the repo). Files named `*.sync-tmp.*` are
+  ignored.
+- A repo path with an empty, `.` or `..` component, or one that would resolve outside
+  its root (`~/.claude`, `conflicts/`, `trash/` or `data/`), is refused with an ERROR.
 - Text files (same extension list as `is_text` today) are canonicalised on the way in:
   `/Users/<ME>/` becomes `/Users/__USER__/` and `-Users-<ME>-` becomes
-  `-Users-__USER__-`, and the reverse on the way out. Project directory names use the same
-  rule. Other files are copied byte for byte.
+  `-Users-__USER__-`, and the reverse on the way out (every write into `~/.claude`,
+  including restores and parked copies). Project directory names use the same rule. Other
+  files are copied byte for byte. Canonicalisation is a byte replacement; content is never
+  decoded as text, so invalid UTF-8 cannot raise.
 - The exec bit travels (git records it). Other mode bits do not.
+- Entries in `data/` are regular files (mode 100644 or 100755). A remote entry of any
+  other mode (a symlink or a submodule, which `git diff --raw` shows with mode 120000 or
+  160000, usually as status `T`) stops the run with an ERROR naming it. Neither the old nor
+  the new code creates such entries.
+- Every write into `~/.claude`, `data/`, `conflicts/` or `trash/` creates missing parent
+  directories first. Writes into `~/.claude` and `data/` are atomic (a temporary file named
+  `*.sync-tmp.*` in the same directory, then a rename).
 
 All comparisons below are on canonical bytes plus the exec bit: local content is
 canonicalised before it is compared with repo content, and a file whose bytes match but
@@ -153,22 +180,29 @@ path, the base version is what both sides last agreed on, which makes it the com
 ancestor for a three-way decision.
 
 Invariant when no run holds the lock: `HEAD == base`, and `data/` in the work tree equals
-the base tree, with no untracked files. Every run starts by restoring it if a killed run
-broke it: if `HEAD != base` or `git status --porcelain -- data` (which lists untracked
-files too) is not empty, run `git reset -q --hard base` and then
-`git clean -qfdx -- data`. With no base, the same restore runs against `HEAD` (HEAD does
-not move). The clean matters: `reset --hard` leaves untracked files from a killed run in
-place, and the next `git add -A -- data` would commit them. This is safe because `data/` is
+the base tree, with no untracked or ignored files. Every locked run starts by restoring it
+in case a killed run broke it: if `HEAD != base` or `git status --porcelain -- data`
+(which lists untracked files too) is not empty, run `git reset -q --hard base`; then
+always run `git clean -qfdx -- data`, because the porcelain check does not show ignored
+leftovers such as `*.sync-tmp.*`. With no base, the same restore runs against `HEAD` (HEAD
+does not move). The clean matters: `reset --hard` leaves untracked files from a killed run
+in place, and the next `git add -A -- data` would commit them. This is safe because `data/` is
 derived and any unpushed local content still lives in `~/.claude`, where the next scan
 finds it again.
 
 Pending push. A second local ref, `refs/claude-sync/pending`, is set by push to the commit
 it is about to push, just before `git push` (6.10 step 8). On success push moves base to
-it and deletes it. When a later run finds it, right after its fetch: if pending is an
-ancestor of `O`, the push landed although the pushing run never saw the reply (timeout or
-kill), so base becomes pending and the work tree is reset to it. Pending is deleted either
-way. Without this, this machine's own landed commit would come back as remote changes and
-produce spurious keep-both conflicts.
+it and deletes it. Whichever run fetches next resolves it, right after its fetch and
+before anything reads `data/`:
+1. `P` = the commit pending points at.
+2. If `P` is an ancestor of `O`, the push landed although the pushing run never saw the
+   reply (timeout or kill): `git reset -q --hard P`, then
+   `git update-ref refs/claude-sync/base P`.
+3. `git update-ref -d refs/claude-sync/pending`, whether or not step 2 ran.
+
+The ref is deleted last, so a kill between these steps leaves pending in place and the
+next run repeats them. Without this, this machine's own landed commit would come back as
+remote changes and produce spurious keep-both conflicts.
 
 No base ref (the first run of the new code on a machine, for migration or a new machine):
 - The base is never derived from `HEAD`. The old code moves `HEAD` without applying it
@@ -184,8 +218,8 @@ No base ref (the first run of the new code on a machine, for migration or a new 
   - No marker (migration of a Mac that already synced with the old code): the local file
     stays in place and the remote copy goes to `conflicts/`. Local edits made since the old
     code last ran are what this tool exists to protect.
-  - `$REPO/.fresh-machine` present (a new Mac): the remote file goes in place and the local
-    copy goes to `conflicts/`. A new Mac's local files are defaults, for example a
+  - `$REPO/.fresh-machine` present (a new Mac): the local copy is saved to `conflicts/`
+    first, then the remote file goes in place (6.9). A new Mac's local files are defaults, for example a
     `settings.json` holding only the hooks the nix ensure step wrote, and pushing them
     would overwrite the real ones on the other Mac. The nix bootstrap creates the marker
     when it clones (section 7); a by-hand setup creates it with `touch` (README). The
@@ -194,31 +228,47 @@ No base ref (the first run of the new code on a machine, for migration or a new 
 - Files that exist only locally are not in the diff and are not touched; the first push
   publishes them. Files deleted locally since the old code last ran come back from the
   remote, because there is no base to show they were deleted. Both are the safe direction.
-- Push with no base runs a full pull (6.7) first. If that pull does not set the base
-  (offline, an error, the lock busy), push stops without pushing anything. Nothing is
-  pushed until this machine has taken the remote in once.
+- Push with no base runs the pull steps (6.7 steps 2 to 9) first, in the same process
+  and under the lock push already holds; it never takes the lock a second time. If they
+  do not set the base (offline, an error, a guard), push stops without pushing anything.
+  Nothing is pushed until this machine has taken the remote in once.
 - The first pull reads every remote file (about 1368 today), so it is slower than a
-  normal pull. If a SessionStart hook kills it, nothing is lost (the base has not moved)
-  and the timer push, which has no timeout, completes it.
+  normal pull and may not finish inside the 60 s SessionStart hook. If the hook kills it,
+  nothing is lost (the base has not moved) and the next timer push, which has no timeout,
+  completes it through the in-process pull above.
+- Keep-both at a first pull has a cost the other Mac pays. On a Mac without the marker the
+  local copy stays and the base moves to `O`, so the next push publishes the local copy.
+  The other Mac's file still equals its base there, so it takes the published copy with
+  no merge and no notice. Its own version then lives only in git history and in this
+  Mac's `conflicts/` (30 days), and only this Mac's notice mentions it. This is the
+  owner's keep-both rule (section 11) applied to the first run; rollout step 2 keeps such
+  paths near zero.
 
 ### 6.5 Lock
 
-- `fcntl.flock` on `$REPO/.sync.lock`. The kernel releases it when the process dies,
-  including on SIGKILL, so it cannot go stale.
+- `fcntl.flock` on `$REPO/.sync.lock`, opened with create and read-write. The kernel
+  releases it when the process dies, including on SIGKILL, so it cannot go stale. One run
+  takes it once; nothing inside a run takes it again.
 - Waits with a budget, then skips with an INFO log line and exit 0: pull 20 s, push 60 s,
   status none (it does not take the lock), dry-run 20 s. Overridable through
   `CLAUDE_SYNC_LOCK_WAIT`.
 - Transition guard: while the old `.sync.lock.d` directory exists and is younger than
   900 s, an old-code run may be active, so the new code treats the lock as busy. An
-  older one is removed with a WARN line.
+  older one is removed with a WARN line. 900 s is the old code's own stale limit
+  (`CLAUDE_SYNC_LOCK_STALE`, bin/claude-sync line 149), so an old run would remove it at
+  the same age.
 
 ### 6.6 Repo checks at the start of every locked run
 
 1. Remove `.git/index.lock`, `.git/HEAD.lock`, ref `*.lock` files and
    `.git/packed-refs.lock` older than 60 s (we hold the lock, so they belong to a killed
-   run), with a WARN line each.
-2. Remove `.git/rebase-merge` and `.git/rebase-apply` left by the old code, keeping an
-   autostash as a stash entry as today, with a WARN line.
+   run), with a WARN line each. When this run kills a git command at its timeout, it
+   removes those lock files at once, whatever their age, since the killed child was the
+   only git process allowed to hold them.
+2. Remove `.git/rebase-merge` and `.git/rebase-apply` left by the old code, with a WARN
+   line. If the directory holds an `autostash` file, first run
+   `git stash store -m "autostash of a killed sync run" <its sha>` (as bin/claude-sync
+   line 238 does today); a failed store is logged as WARN and does not stop the removal.
 3. If tracked files outside `data/` are modified
    (`git status --porcelain --untracked-files=no -- . ':(exclude)data'`), stop with an
    ERROR naming them. A reset would destroy hand edits to `bin/`.
@@ -231,9 +281,10 @@ No base ref (the first run of the new code on a machine, for migration or a new 
 
 Ciphertext guard, independent of the check above: any content read from git as `B` or
 `R`, and any content about to be written into `~/.claude` or into `data/`, that starts
-with the `\0GITCRYPT` header is refused with an ERROR and the run stops. This guard is
-load-bearing, not a backstop: git returns undecrypted content without any warning whenever
-the filter does not run (verified, see 6.7 step 7).
+with the `\0GITCRYPT` header is refused with an ERROR and the run stops. The check runs on
+the raw bytes, before canonicalisation. This guard is load-bearing, not a backstop: git
+returns undecrypted content without any warning whenever the filter does not run
+(verified, see 6.7 step 7).
 
 ### 6.7 Pull
 
@@ -244,30 +295,35 @@ the filter does not run (verified, see 6.7 step 7).
    alone can leave it stale without an error, depending on the clone's fetch config.
    Failure: classify (6.11); offline gives WARN and exit 0, anything else gives ERROR and
    exit 1. Stop either way.
-3. `O` = `origin/<BRANCH>`. Resolve a pending push (6.4). If there is a base and
-   `O == base`, stop: nothing remote to take.
-4. Common ancestor `M`: with no base, the empty tree (6.4). Otherwise `base` if it is an
-   ancestor of `O`, else `git merge-base base O` with an INFO line ("base is not an
-   ancestor of origin", which means rewritten remote history). No common ancestor: ERROR,
-   stop.
+3. `O` = `origin/<BRANCH>`. Resolve a pending push (6.4), then read the base again. If
+   there is a base and `O == base`, stop: nothing remote to take.
+4. Common ancestor `M`: with no base, the empty tree (6.4); otherwise always `base`. The
+   base tree is exactly what this machine last agreed with, and a tree diff needs no
+   ancestry, so this holds even if the remote history was rewritten. In that case (base
+   is not an ancestor of `O`) log one INFO line, "remote history was rewritten", and go
+   on. No merge-base is computed.
 5. Remote changes: `git diff --raw -z --no-renames M O -- data/`. This lists content and
    exec-bit changes. git-crypt encryption is deterministic, so blob ids compare correctly
    without decrypting anything.
-6. Remote mass delete guard: if the remote deletes more than 20 files and more than it
-   keeps, stop with an ERROR before writing anything, without resetting and without moving
-   the base. Every pull and push on this machine then stops the same way, with the stdout
+6. Remote mass delete guard: if the remote deletes more than 20 files and the deletions
+   also outnumber the files left under `data/` in `O`, stop with an ERROR before writing
+   anything, without resetting and without moving the base. (The same predicate guards
+   push in 6.10 step 6, counted against the tree about to be committed. A renamed folder
+   counts as deletes plus adds, but cannot outnumber what remains, so it passes.) Every
+   pull and push on this machine then stops the same way, with the stdout
    notice, until the remote is fixed or the user runs
    `CLAUDE_SYNC_ALLOW_PRUNE=1 claude-sync pull`, which applies the deletions (into trash).
    Applying only the other changes and moving the base, as an earlier draft did, would
    leave the skipped deletions unreachable and let the next push undo them on the remote.
 7. Read contents for the changed paths only. `L` = canonical local content (absent if no
-   file). `B` = decrypted content at `M`: read from the `data/` work tree when `M` is the
-   base, because the invariant guarantees it holds the decrypted base tree. Every path
-   into these steps must therefore start from a restored invariant, including a push
-   retry (6.10 step 8). `R`, and `B`
-   when `M` is not the base, come from a temporary checkout of those paths into a private
-   temporary directory with a temporary index:
-   `GIT_ATTR_SOURCE=<rev> GIT_INDEX_FILE=<tmp index> git --work-tree=<tmp dir> checkout <rev> --pathspec-from-file=- --pathspec-file-nul`.
+   file). A local path that exists but cannot be read or listed is an ERROR that stops
+   the run; only a path that is confirmed absent counts as absent. `B` = decrypted
+   content at `M`: absent with no base, otherwise read from the `data/` work tree, because
+   the invariant guarantees it holds the decrypted base tree. Every path into these steps
+   must therefore start from a restored invariant, including a push retry (6.10 step 8).
+   `R` comes from a temporary checkout of those paths into a private temporary directory
+   with a temporary index:
+   `GIT_ATTR_SOURCE=<rev> GIT_INDEX_FILE=<tmp index> git -C $REPO --work-tree=<tmp dir> checkout <rev> --pathspec-from-file=- --pathspec-file-nul`.
    This runs the git-crypt smudge filter exactly as a normal checkout does, once per file,
    in one git process. The temporary directory is removed when the run ends.
    Verified on git 2.54.0 with a length-changing test filter:
@@ -294,6 +350,7 @@ the filter does not run (verified, see 6.7 step 7).
    `.fresh-machine` if present.
 10. Log a summary line. If there were conflicts, kept-over-delete cases or errors, also
     print one short line to stdout (a SessionStart hook's stdout reaches the session).
+    Every stop with an ERROR, in any command, prints the notice too before exit 1.
 
 A run killed anywhere before the update-ref in step 9 is safe to repeat: the base has not
 moved, paths already written now have `L == R` and are skipped, and the next run's
@@ -314,32 +371,51 @@ Equality means the same canonical bytes and the same exec bit.
 | `L != B` (changed here) | deleted | keep `L`; WARN "local edit beats remote delete" (the next push re-adds it) |
 | `L != B` | changed | merge (6.9) |
 
+"Write `R` locally" always means: decanonicalise `R` (6.3), then write it atomically. "Move
+to trash" means a move to `$REPO/trash/<stamp>/<path relative to ~/.claude>`, where
+`<stamp>` is the run's start time in UTC as `2026-10-25T16-31-02Z` (no colons); all of a
+run's conflicts and trash share one stamp. A path that is a symlink locally, or passes
+through one, is not in this table at all (6.3).
+
 When only the exec bit differs between `L` and `R`, the bit follows its own three-way
 rule: if `L`'s bit equals `B`'s, take `R`'s (chmod); otherwise keep `L`'s. A merged
 result gets its exec bit by the same rule. With no `B` (added on both sides, including a
 first pull), keep `L`'s bit, except on a machine marked `.fresh-machine`, where `R`'s bit
 is taken, matching which side keeps the place in 6.4.
 
-Race guard: just before replacing a local file, re-stat it; if size or mtime moved since
-`L` was read, re-read and decide again (at most 3 times, then treat as a conflict). This
-narrows the window where a session's write lands between the read and the rename.
+Race guard: just before replacing a local file or moving it to trash, re-stat it; if it
+appeared, disappeared, or its size or mtime moved since `L` was read, re-read it
+(canonicalised, like any `L`) and decide again. After 3 such attempts the path becomes a
+keep-both: the local file is left as it is and the remote version is parked. This narrows
+the window where a session's write lands between the read and the rename. If the scan of
+a later push reads a file in the middle of a session's write, that push may publish the
+partial content; the push after the write completes publishes the full file. This risk is
+the same as today's and is not solved here.
 
 ### 6.9 Merge rules
 
 - Text files: `git merge-file -p <L> <B> <R>` (temporary files outside `~/.claude`).
-  Exit 0 is a clean merge: write the result locally. The next push publishes it.
+  Exit 0 is a clean merge: write the result locally. The next push publishes it. Exit 1
+  to 127 is a conflict count. Any other exit (git reports its own errors as 255, verified
+  for a missing input and a binary input) is an ERROR that stops the run before the base
+  moves, never a keep-both.
 - `MEMORY.md` (any project): the same with `--union`, so conflicting hunks keep both
   sides' lines. `--union` exits 0 even when hunks conflicted, so its exit code says
   nothing about conflicts. Check after merging: every `](file.md)` link that is in both
   `L` and `R`, or that one side added (absent from `B`), must be in the result. A link
   one side removed on purpose may be gone. If the check fails, fall back to keep-both.
-- `*.json`: the merged result must parse with `json.loads`, otherwise keep-both. Invalid
-  JSON is never written.
+- `*.json`: the merged result must parse with `json.loads` with duplicate keys rejected
+  (an `object_pairs_hook` that raises on a repeated key), otherwise keep-both. A line
+  merge in which both sides added the same key would otherwise pass with one value
+  silently dropped. Any JSON content is parsed again just before it replaces a local
+  file. Invalid JSON is never written.
 - Binary files (not in the text list), or text with conflicting hunks: keep-both.
 - Keep-both: the local file stays as it is. The remote version, decanonicalised, goes to
-  `$REPO/conflicts/<UTC timestamp>/<path relative to ~/.claude>`. Logged as WARN and
-  reported on stdout. Because the base then advances, the local version wins on the next
-  push, and the remote version is preserved in git history as well as in `conflicts/`.
+  `$REPO/conflicts/<stamp>/<path relative to ~/.claude>` (stamp as in 6.8). Logged as
+  WARN and reported on stdout. Because the base then advances, the local version wins on
+  the next push, and the remote version is preserved in git history as well as in
+  `conflicts/`. On the other Mac the published local version replaces its file with no
+  notice there; that is the owner's keep-both rule (section 11).
   For a type clash (6.7 step 8) the local side is a directory, so the next push sends the
   directory's files and a delete of the remote file, which the other Mac moves to trash
   by the 6.8 table.
@@ -348,37 +424,50 @@ narrows the window where a session's write lands between the read and the rename
   `git merge-file`: git narrows the conflict, so lines both sides share are kept once and
   only the differing lines conflict; with `--union` the result is a line union in order.
   If it does not merge cleanly: keep-both, except in a first pull on a machine marked
-  `.fresh-machine` (6.4), where the remote file goes in place and the local copy goes to
-  `conflicts/` instead.
+  `.fresh-machine` (6.4), where the local file is first copied (not moved) to
+  `conflicts/`, and only once that copy is written does the remote file go in place. A
+  failed copy stops the run like any other write error (6.7 step 8), so the local file is
+  never replaced without a saved copy.
 
 ### 6.10 Push
 
 1. Lock, checks (the invariant restore makes `data/` equal base).
-2. No base: run a full pull (6.7) first. If it does not set the base, stop without
-   pushing (INFO when offline or the lock is busy, ERROR otherwise).
+2. No base: run pull steps 2 to 9 first, in this process under the lock already held
+   (6.4). If they do not set the base, stop without pushing (WARN when offline, ERROR
+   otherwise).
 3. Scan: for every allowlisted local file, compare canonical local bytes and exec bit with
    the file in the `data/` work tree, which the invariant guarantees is the decrypted base.
-   Also list files in `data/` with no local counterpart (local deletes). In-process reads,
-   no forks, no git calls for unchanged files. If nothing differs: log "no changes" at
-   DEBUG level and exit 0 without touching the network. This makes the 5 minute timer
-   cheap.
-4. Fetch (as 6.7 step 2) and resolve a pending push (6.4). If `O != base`, run pull steps
-   4 to 9 first, then scan again. If the remote mass delete guard stops that pull, push
-   stops too.
+   Also list files in `data/` with no local counterpart (local deletes). Only a path
+   confirmed absent is a delete: a file or folder that cannot be read or listed is an
+   ERROR that stops the run before any delete or commit. Symlinked paths are skipped
+   (6.3). In-process reads, no forks, no git calls for unchanged files. If nothing
+   differs: log "no changes" at DEBUG level and exit 0 without touching the network. This
+   makes the 5 minute timer cheap. A pending push left by an earlier run is then resolved
+   by the next run that fetches.
+4. Fetch (as 6.7 step 2) and resolve a pending push (6.4), then read the base again. If
+   `O != base`, run pull steps 4 to 9 first, in this process. If they stop for any
+   reason (a guard, an error, the ciphertext check), push restores the invariant and
+   stops without committing or pushing. If the base moved in this step for any reason
+   (pending resolved, or the pull steps ran), scan again; if the new scan is empty, exit
+   0.
 5. Empty-file guard: a 0-byte local file whose base version is not empty is never pushed.
    If its mtime is older than 10 minutes it is restored from base with a WARN (the empty
-   file is moved to trash first); a younger one may be a write in progress and is left
-   alone.
-6. Local mass delete guard (as today): more than 20 deletions and more deletions than
-   kept files: refuse with ERROR unless `CLAUDE_SYNC_ALLOW_PRUNE=1`, restore the
-   invariant, exit 1.
+   file is moved to trash first; the restore is decanonicalised and takes the base's exec
+   bit); a younger one may be a write in progress and is left alone.
+6. Local mass delete guard: more than 20 deletions, and the deletions also outnumber the
+   files that would remain under `data/` after the push (the predicate of 6.7 step 6):
+   refuse with ERROR unless `CLAUDE_SYNC_ALLOW_PRUNE=1`, restore the invariant, exit 1.
 7. Write changed files into `data/` (atomic, through temporary names matching
-   `*.sync-tmp.*`), set their exec bit, delete removed ones, `git add -A -- data`, commit
-   `sync: <ME>@<LocalHostName> <UTC time>` on top of `HEAD` (which is `O`).
+   `*.sync-tmp.*`), set their exec bit, delete removed ones, `git add -A -- data`. If the
+   index then has no staged change (every difference was skipped, for example by the
+   empty-file guard), log "no changes" and exit 0 without committing and without setting
+   pending. Otherwise commit `sync: <ME>@<LocalHostName> <UTC time>` on top of `HEAD`
+   (which is `O`).
 8. `git update-ref refs/claude-sync/pending HEAD`, then `git push -q origin HEAD:<BRANCH>`
    with a 30 s timeout. Rejected because the remote moved: first restore the invariant
    (`git reset -q --hard base`, `git clean -qfdx -- data`) and delete pending, then go
-   back to step 4, at most 3 attempts in total, then ERROR. The restore is required, not
+   back to step 4 (fetch, pull steps, a full new scan, and steps 5 to 8 again), at most 3
+   attempts in total, then ERROR. The restore is required, not
    tidying: step 7 wrote the local versions into `data/`, and the pull steps read `B` from
    `data/` (6.7 step 7), so without it a local edit would read as unchanged and be
    overwritten by the remote version with no merge and no copy. Offline or timed out:
@@ -395,30 +484,38 @@ no autostash, no merge commits.
 - The tool appends to `$REPO/last-sync.log` itself, one line per event:
   `2026-10-25T16:31:02Z pid=1234 pull WARN <message>`. Levels DEBUG (not written unless
   `CLAUDE_SYNC_DEBUG=1`), INFO, WARN, ERROR.
-- Each run writes one summary line, for example
-  `pull done in 0.8s: 3 remote changes, 2 written, 1 merged, 0 kept-both, 0 trashed`.
+- Each run that fetches or writes anything logs one summary line at INFO, for example
+  `pull done in 0.8s: 3 remote changes, 2 written, 1 merged, 0 kept-both, 0 trashed`. A
+  push that finds no local changes (6.10 step 3) logs at DEBUG only, so the 5 minute
+  timer does not fill the log.
 - Rotation: above 5 MB the log is renamed to `last-sync.log.1` (one generation).
 - Git failures log the command and the last 4 stderr lines (hint lines dropped).
 - Offline means the stderr matches a network pattern (could not resolve host, network is
   unreachable, connection timed out or refused, operation timed out, `ssh: connect to
-  host`) or the subprocess timed out. Everything else is an ERROR.
+  host`) or the subprocess timed out. Offline is logged as WARN everywhere (pull, push,
+  and the pull steps inside push). Everything else is an ERROR.
 - Exit codes: 0 for success, skip or offline; 1 for an error. Hooks keep `|| true`.
 - An uncaught exception is logged with its traceback and exits 1.
 - stdout notice: plain text, one line, at most 200 characters, only when there is
   something to act on (kept-both conflicts, local-edit-beats-delete, ERROR, or the shim
   finding no usable python). Example:
   `claude-sync: 2 conflicts kept both, remote copies in ~/.claude-sync/conflicts/2026-10-25T16-31-02Z (see last-sync.log)`.
-- Retention: at the end of each locked run, folders in `conflicts/` and `trash/` older
-  than 30 days are removed.
+- Retention: at the end of each locked run, including one that stopped with an error,
+  stamp folders (6.8) in `conflicts/` and `trash/` older than 30 days are removed.
 
 ### 6.12 Commands
 
 - `pull`, `push`: as above.
-- `status`: no lock, no network. Prints base (or "none"), HEAD, `origin/<BRANCH>` from the
-  last fetch, whether a pending push or `.fresh-machine` exists, how many local changes the
-  scan finds, how many `conflicts/` folders exist, and the last summary line from the log.
-- `dry-run` (alias `dry`): the push scan only; prints what would be added, changed and
-  deleted. No git writes.
+- `status`: no lock, no network, no writes. Prints base (or "none"), HEAD,
+  `origin/<BRANCH>` from the last fetch, whether a pending push or `.fresh-machine`
+  exists, how many local changes the scan finds, how many `conflicts/` folders exist, and
+  the last summary line from the log. The scan count is replaced by "locked" when
+  `data/CLAUDE.md` starts with the git-crypt header, and by "unknown (a run is in
+  progress or was interrupted)" when the invariant (6.4) does not hold, because in both
+  cases `data/` is not the decrypted base and a count would be wrong.
+- `dry-run` (alias `dry`): takes the lock (20 s wait), runs the checks of 6.6 including
+  the unlock and the invariant restore, then the push scan only; prints what would be
+  added, changed and deleted. No commit, no fetch, no push.
 
 memory-reconcile is no longer called from pull or push. The union merge in 6.9 covers the
 case it was built for (two machines overwriting each other's index). It stays in `bin/`
@@ -453,8 +550,10 @@ written, is the slow part:
 - pull with 50 remote changes: under 5 s.
 - push with 50 local changes: under 10 s.
 - first pull with no base (every file read): under 60 s. A kill there is harmless (6.4).
-Hook timeouts after section 7: SessionStart 60 s, SessionEnd 10 s (kick only). Lock waits
-(20 s pull) plus fetch (20 s) still fit inside 60 s.
+Hook timeouts after section 7: SessionStart 60 s, SessionEnd 10 s (kick only). For a
+normal pull, the lock wait (20 s) plus the fetch (20 s) plus the work still fit inside
+60 s. A first pull may not; a kill there is harmless and the timer push completes it
+(6.4).
 
 ## 7. Nix module changes (dotnix, separate branch and worktree)
 
@@ -463,7 +562,11 @@ In `home-manager/claude-sync-hooks.nix`:
    It replaces any claude-sync entry that differs from the wanted one, and runs over
    `~/.claude/settings.json` and every regular file matching
    `~/Library/Application Support/orca/claude-profiles/*/home/settings.json`. Symlinks
-   (such as `~/.claude-work/settings.json`) are skipped. Writes stay atomic.
+   (such as `~/.claude-work/settings.json`) are skipped. It parses the file, replaces only
+   hook entries whose command contains `claude-sync` (adding a wanted one where none
+   exists), and keeps every other key and every other hook entry, Orca's included, in
+   place. The result is parsed again before an atomic rename, and an unchanged file is not
+   rewritten.
 2. Wanted hooks:
    - SessionStart: `GIT_TERMINAL_PROMPT=0 "$HOME/.claude-sync/bin/claude-sync" pull 2>>"$HOME/.claude-sync/last-sync.log" || true`,
      timeout 60. stdout is no longer redirected, so conflict notices reach the session.
@@ -497,8 +600,10 @@ Hermetic harness, enforced in a shared base class:
   `file://` path), and one clone per simulated machine. `CLAUDE_SYNC_REPO`,
   `CLAUDE_SYNC_USER` and `HOME` are set for each run, and the tool runs as a subprocess
   through `bin/claude-sync`, as a hook would.
-- `GIT_CONFIG_NOSYSTEM=1` and a temporary global gitconfig (user name and email, no hooks
-  path), so the real git configuration and the git-lfs pre-push hook are not used.
+- `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL` set to a temporary gitconfig (user name
+  and email, no hooks path), and `XDG_CONFIG_HOME` removed, so the real git configuration
+  and the git-lfs pre-push hook are not used. With `XDG_CONFIG_HOME` set, git reaches the
+  real `~/.config/git/config` even under a temporary `HOME` (seen on this Mac).
 - The base class refuses to start if any of these resolve under the real home's
   `.claude`, `.claude-sync` or `.config/git-crypt`.
 - No network. No test touches `~/.claude`, `~/.claude-sync` or the real key.
@@ -511,8 +616,9 @@ Required cases:
 4. Both sides change the same lines: local kept, remote copy in `conflicts/`, stdout
    notice, WARN in the log.
 5. MEMORY.md: both sides add entries at the same spot: union, no link lost.
-6. settings.json: both sides change it; the result is valid JSON or a kept-both, never
-   invalid JSON.
+6. settings.json: both sides change different keys; the result is valid JSON holding both
+   sides' changes. Both sides add the same key with different values; the result is a
+   keep-both, never a file with a duplicate key and never invalid JSON.
 7. Remote delete of an unchanged file goes to trash; of a locally edited file, kept.
 8. Local delete is pushed; the other machine moves its copy to trash.
 9. Mass delete guard in both directions. Remote: the pull stops before writing anything,
@@ -533,7 +639,8 @@ Required cases:
 12. Two users (`alice`, `bob`): paths and project directory names are rehydrated.
 13. Concurrent sessions: 8 processes mixing pull and push on one HOME while another
     process keeps editing files. All exit 0, no edit lost, no lock left, and afterwards
-    `HEAD == base` with a clean `data/`.
+    `HEAD == base` with a clean `data/`. After one final push, every edit's final bytes
+    are in the remote tree and, after a pull there, on the other machine.
 14. SIGKILL in the middle of a pull and of a push (several kill points): the next run
     succeeds, no 0-byte files, no wedge.
 15. Timing: the budgets in 6.14 on the git-crypt fixture described there. Without
@@ -566,12 +673,16 @@ Required cases:
     bit by the rule in 6.8; with no base, a both-sides bit difference keeps the local bit,
     or the remote bit on a `.fresh-machine` Mac.
 26. Leftovers: an untracked file and a `*.sync-tmp.*` file left in `data/` by a killed run
-    are removed by the next run and never committed.
+    are removed by the next run and never committed, including when the ignored file is
+    the only leftover and `HEAD == base`.
 27. Push landed but unseen: the remote has this machine's commit, pending is set, and the
     base was not moved (as after a timeout or a kill). The next run moves the base to it,
     with no keep-both and no stdout notice.
-28. MEMORY.md removals: one side removes an entry while the other adds one. The removal
-    stays removed, the addition is kept, and there is no keep-both.
+28. MEMORY.md removals: one side removes an entry while the other adds one in a different
+    hunk (at least one unchanged line apart). The removal stays removed, the addition is
+    kept, and there is no keep-both. (`--union` keeps both sides of a single conflicting
+    hunk, so a removal inside the same hunk as the other side's change comes back; that
+    case is not claimed.)
 29. Stale tracking ref: `origin/<BRANCH>` is rewound by hand in the clone; the next pull
     still sees the remote tip.
 30. Rejected push: machine A has a local edit to a file and is pushing; machine B pushes a
@@ -579,6 +690,26 @@ Required cases:
     rejected. A's edit is not overwritten: the result is a clean merge, or a keep-both
     with the stdout notice. A second variant where B changed a different file ends with
     both changes on the remote and on both machines.
+31. Hook environment: the tool runs with its working directory inside another git repo
+    and with `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` pointing at that repo. The
+    sync works, and the other repo's HEAD, index and files are unchanged.
+32. Push after a failed in-push pull: the remote has a change the pull steps cannot apply
+    (a write error on that path); push stops, nothing is committed or pushed, and the
+    invariant holds.
+33. First pull completed by push: no base, a first pull killed before its update-ref, then
+    a push with no hook timeout. The push sets the base through its own pull steps
+    without waiting on its own lock, then pushes the local-only files.
+34. Symlinks: a local symlink at a synced path (file and folder) pointing outside
+    `~/.claude` is not read, written, trashed or counted as a delete, and its target is
+    unchanged after a pull that changes that path remotely.
+35. Unreadable local folder: a synced folder without read permission makes push stop with
+    an ERROR and push no deletes.
+36. Fresh-machine copy order: when the copy of the local file into `conflicts/` fails, the
+    local file is still in place and the base does not move.
+37. Nothing to commit: every local difference is skipped (a young 0-byte file); push
+    exits 0, makes no commit and leaves no pending ref.
+38. `status` on a locked repo prints "locked", and after a killed push prints "unknown",
+    instead of a change count.
 
 ## 9. Rollout (each step needs the owner's yes)
 
@@ -586,7 +717,17 @@ Code first, nix second, never the other way round (section 7).
 
 1. Review the branch `dfroberg/TO-772-claude-sync-rewrite`.
 2. Run the old `claude-sync push` once on the main Mac (EZ-MBP-GD4RPHKWL4) only, right
-   before step 3, so its local files and the remote agree. Anything that still differs
+   before step 3, so its local files and the remote agree. Pre-check first, because the
+   old push writes this Mac's files over whatever the other Mac changed (section 2 item
+   2): run `git -C ~/.claude-sync fetch -q origin`, then
+   `git -C ~/.claude-sync log -1 --format='%h %cI %s' --grep='@Dannys-MacBook-Pro ' origin/main`
+   and the same with `--grep='@EZ-MBP-GD4RPHKWL4 '`. If the second Mac's newest commit
+   is newer than the main Mac's newest commit, stop: list its files with
+   `git -C ~/.claude-sync show --name-only --format= <sha> -- data` and decide with the
+   owner, path by path, before pushing. (A second-Mac commit older than the main Mac's
+   newest one was already taken in or overwritten by that later push, so the step adds
+   no new loss for it. `HEAD..origin/main` is not enough as a check, because the old
+   push moves `HEAD` without applying.) Anything that still differs
    on both sides at its first new-code run has no base to merge against: the local copy
    stays and the remote copy goes to `conflicts/` (6.4). The last old-code pull, which
    brings in the new code, still runs the old `apply()` once.
@@ -656,13 +797,33 @@ and `.fresh-machine`.
   through one last old pull, which overwrites its local files with the remote as the old
   code always has.
 
+Changes made after the owner's approval, from the grok-4.7 round (section 12). These alter
+or sharpen approved behaviour:
+- Keep-both, consequence made explicit (6.4, 6.9): the next push publishes the local copy,
+  and the other Mac takes it with no notice there; its version survives only in git
+  history and in this Mac's `conflicts/` for 30 days. Unchanged as a rule, now stated.
+- Rollout step 2 gains a pre-check: if the second Mac has a commit newer than the main
+  Mac's newest, the old push waits for a path-by-path decision.
+- Symlinked paths inside `~/.claude` are outside the sync on that Mac, both ways. Pull
+  never writes through a symlink. (Today none of the synced paths is one.)
+- The common ancestor is always the base. If the remote history was ever rewritten, the
+  sync carries on from the base with an INFO line instead of stopping with an ERROR.
+- JSON merges with a key added on both sides become a keep-both instead of a silent pick.
+- A remote entry that is a symlink or a submodule stops the sync with an ERROR.
+
 ## 12. Adversarial review
 
-grok-4.7 could not be used: `XAI_API_KEY` is not set in this session or in a login shell,
-so xAI was unreachable. Per the owner's rule the round ran on Fable instead, on
-2026-10-25, against the draft committed as e8f137e1. The reviewer tested its claims with
-small git experiments in a scratch directory. Verdict: NEEDS FIXES (1 critical, 6 major,
-5 minor). All twelve findings were accepted; none changed the chosen approach.
+Two rounds ran. The first ran on Fable, because the lead wrongly concluded that xAI was
+unreachable: it checked only for `XAI_API_KEY` in the environment and missed
+`~/.config/xai/env`, which defines it. The owner pointed this out, and the required
+grok-4.7 round then ran against the approved design (see "Round 2" below). The Fable
+round and its re-check stay on record as they happened.
+
+### Round 1: Fable
+
+Run on 2026-10-25 against the draft committed as e8f137e1. The reviewer tested its claims
+with small git experiments in a scratch directory. Verdict: NEEDS FIXES (1 critical, 6
+major, 5 minor). All twelve findings were accepted; none changed the chosen approach.
 
 | # | Severity | Finding | Resolution |
 |---|---|---|---|
@@ -691,7 +852,7 @@ Verification commands run by the lead for findings 1 and 3 (scratch repo, test f
   lines once and both added lines, exit 0. The same without `--union` conflicted only on
   the differing lines, exit 1.
 
-### Re-check of the fixes
+### Round 1: re-check of the fixes
 
 One Fable pass on the fixes only (the diff from e8f137e1 to bc22a81c), 2026-10-25. It
 confirmed all twelve findings resolved, and re-ran the temporary checkout experiment
@@ -707,3 +868,48 @@ for four new defects introduced by the fixes, all accepted:
 | N2 | Major | Turning every filesystem error into a keep-both while the base advanced let a transient failure (disk full, read-only file) leave a stale local file that the next push sent over the other Mac's edit. | 6.7 step 8: keep-both only for a type clash (`EISDIR`, `ENOTDIR`); any other error stops the run before the base moves. 6.9 states what the next push does after a type clash. Test 24. |
 | N3 | Minor | The exec-bit rule had no answer with no `B` (added on both sides). | 6.8: keep `L`'s bit, or `R`'s on a `.fresh-machine` Mac. Test 25. |
 | N4 | Minor | Rollout step 2 ran the old push on both Macs, but the old push never applies, so the second Mac would push its stale copies over the main Mac's. | Section 9 step 2: the old push runs on the main Mac only; the second Mac takes the new code through one last old pull. The reviewer suggested ordering both pushes instead; not taken, because with two old pushes the later one still overwrites the remote with copies that Mac never applied. |
+
+### Round 2: grok-4.7
+
+Run on 2026-10-25 with `grok_review.py` (model grok-4.7, reasoning effort high, exit 0)
+against the approved design at 288695ef. Verdict: DO NOT EXECUTE (7 critical, 15 major,
+12 minor). The lead checked each claim against the text and, where it named code or git
+behaviour, against bin/claude-sync or a scratch git experiment. 27 were accepted, 5
+accepted in part and 2 rejected, with reasons below.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| C1 | Critical | Hooks start in the user's project, itself a git repo, and may inherit `GIT_DIR` and friends, so `reset --hard`, `clean` and `push` could hit that repo. | Accepted. 6.2: every git command is `git -C $REPO` with the `GIT_*` location variables removed; argv only. Test 31. |
+| C2 | Critical | `python -m claude_sync` from a hook cannot import the package, which is not installed. | Accepted. 6.1: the shim changes to the repo root and runs `python3 -E -s -B -m claude_sync`; its own ERROR goes to the repo's log. |
+| C3 | Critical | Push's no-base pull would try to take the lock push already holds, so a killed first pull is never completed. | Accepted. 6.4, 6.5, 6.10 step 2: the pull steps run in the same process under the held lock; the lock is taken once per run. 6.14 states that a first pull may outlast the hook. Test 33. |
+| C4 | Critical | After the in-push pull, only the mass delete stop was defined; any other stop still pushed. | Accepted. 6.10 step 4: any stop in the pull steps restores the invariant and ends push without a commit. Test 32. |
+| C5 | Critical | No parent directories were created, and trash had no path. | Accepted. 6.3: every write creates missing parents. 6.8: trash path and stamp format. |
+| C6 | Critical | The fresh-machine replace wrote the remote file before parking the local one. | Accepted. 6.4, 6.9: copy the local file to `conflicts/` first; a failed copy stops the run. Test 36. |
+| C7 | Critical | A first-pull keep-both plus base at `O` lets the next push replace the other Mac's version, with no notice there; rollout step 2 can do the same through the old push. | Accepted in part. The rule stays: keep-both letting local win is the owner's call (section 11). Its consequence is now stated in 6.4 and 6.9 and listed in section 11. Rollout step 2 gains a pre-check (newest second-Mac commit against newest main-Mac commit). Not taken: holding such paths back from every push until a manual resolve, which adds state the owner did not ask for. |
+| M1 | Major | The normal write path did not say to decanonicalise. | Accepted. 6.3 and 6.8: every write into `~/.claude` decanonicalises. |
+| M2 | Major | Pending resolution was not an algorithm and could commit on the wrong parent. | Accepted in part. 6.4: save the commit, `reset --hard` to it, move the base, delete the ref last. 6.10 step 4: rescan whenever the base moved. Kept: push's no-change exit before the fetch (the next fetching run resolves pending), so the timer stays cheap. |
+| M3 | Major | The restore check does not see ignored leftovers. | Accepted. 6.4: `git clean -qfdx -- data` runs on every locked run. Test 26. |
+| M4 | Major | `status` and `dry-run` scanned without the unlock or the restore. | Accepted. 6.12: `status` prints "locked" or "unknown" instead of a wrong count; `dry-run` takes the lock and runs the 6.6 checks. Test 38. |
+| M5 | Major | `json.loads` accepts duplicate keys, and test 6 accepted a destructive result. | Accepted in part. 6.9: duplicate keys rejected, JSON parsed again before replace. Test 6 asserts both sides' keys. A full key-survival check was not added: a clean line merge drops a key only when one side deleted it. |
+| M6 | Major | Two mass delete predicates, and "kept" was undefined. | Accepted. One predicate in 6.7 step 6, used by 6.10 step 6: more than 20 deletes and more deletes than files left under `data/` in the destination tree. A folder rename passes, so no rename detection is needed. |
+| M7 | Major | With rewritten history, a merge-base diff misses paths that differ between the base and `O`. | Accepted, with a simpler fix than proposed: `M` is always the base (6.7 step 4). A tree diff needs no ancestry, so merge-base and its ERROR are gone. |
+| M8 | Major | "Treat as a conflict" after the race retries was undefined, and trash moves had no re-stat. | Accepted in part. 6.8: keep-both after 3 attempts; trash moves re-stat too. Not taken: holding the path back from the next push; the partial-write risk is stated in 6.8 and is today's. |
+| M9 | Major | An unreadable local file looked like a delete. | Accepted. 6.7 step 7 and 6.10 step 3: only a confirmed absent path is a delete; anything else stops the run. Test 35. |
+| M10 | Major | Test 13 could pass with no publishing; test 28 claimed more than `--union` does. | Accepted. Test 13 checks final bytes on the remote and the other machine; test 28 uses separate hunks and says what is not claimed. |
+| M11 | Major | Pull followed symlinks out of `~/.claude`. | Accepted. 6.3: symlinked paths are outside the sync both ways. Test 34. |
+| M12 | Major | Decoding text before the ciphertext check could raise on bad bytes. | Accepted. 6.3: byte replacement only; 6.6: the guard checks raw bytes first. |
+| M13 | Major | The nix ensure step could drop Orca's own hooks. | Accepted. Section 7 item 1: replace only claude-sync entries, keep everything else, parse again before the rename. |
+| M14 | Major | An empty commit would be an ERROR. | Accepted. 6.10 step 7: a clean index after `add` exits 0 without a commit or pending. Test 37. |
+| M15 | Major | Removing an old lock directory after 900 s could run beside a live old process. | Rejected after reading the old code: 900 s is its own stale limit (bin/claude-sync line 149), so an old run removes it at the same age. 6.5 now cites it. |
+| m1 | Minor | Autostash handling had no steps. | Accepted. 6.6 item 2 spells out `stash store` as bin/claude-sync line 238 does. |
+| m2 | Minor | The lock file was never created. | Accepted. 6.5: opened with create. |
+| m3 | Minor | A timed-out git command leaves young lock files that block the next run. | Accepted. 6.6 item 1: after killing a git command, its lock files are removed at once. |
+| m4 | Minor | A too-old first interpreter was not skipped. | Accepted. 6.1: the first candidate that reports 3.9 or newer. |
+| m5 | Minor | Offline had three log levels. | Accepted. 6.11: WARN everywhere. |
+| m6 | Minor | "One summary line per run" against "no changes at DEBUG". | Accepted in part. 6.11: every run that fetches or writes logs a summary at INFO; the no-change push stays at DEBUG so the timer does not fill the log. |
+| m7 | Minor | Two stamp formats. | Accepted. 6.8: `2026-10-25T16-31-02Z`, one per run. |
+| m8 | Minor | The notice was specified only on the success path. | Accepted. 6.7 step 10: every ERROR stop prints it. |
+| m9 | Minor | A `git merge-file` error was not told apart from a conflict. | Accepted, verified: a missing input and a binary input both exit 255, a conflict exits 1. 6.9: 1 to 127 is a conflict, anything else is an ERROR. |
+| m10 | Minor | A new 0-byte file could be pushed. | Rejected: it has no base version to lose, so publishing an empty new file loses nothing; the guard exists for files that had content. |
+| m11 | Minor | The commit message and refspec must be argv. | Accepted. 6.2. |
+| m12 | Minor | Diff status `T` was not in the table. | Accepted. 6.3: a remote symlink or submodule entry stops the run with an ERROR. |
