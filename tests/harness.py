@@ -191,6 +191,13 @@ class SyncTestCase(unittest.TestCase):
         if cp.returncode != 0:
             raise AssertionError(cp.stderr.decode())
 
+    def synced(self, *names: str, user: str = "alice") -> List[Machine]:
+        """Make one machine per name and run a first pull on each, so each has a base."""
+        machines = [self.machine(n, user=user) for n in names]
+        for m in machines:
+            m.run("pull")
+        return machines
+
     def machine(self, name: str, user: str = "alice", clone: bool = True) -> Machine:
         m = Machine(self, name, user)
         if clone:
