@@ -8,3 +8,12 @@
 
 # Local push log; noisy, machine-specific, and plaintext in a public repo.
 last-sync.log
+
+.sync.lock
+.fresh-machine
+conflicts/
+trash/
+__pycache__/
+*.sync-tmp.*
+last-sync.log.1
+.hold-*
