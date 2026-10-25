@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Mapping, Optional
 
-from claude_sync import config, pull
+from claude_sync import config, pull, push
 from claude_sync.checks import StopRun
 from claude_sync.context import Ctx, Report
 from claude_sync.fsops import CiphertextError
@@ -23,11 +23,6 @@ LOCK_WAIT = {"pull": 20.0, "push": 60.0, "dry-run": 20.0}
 EXPECTED_ERRORS = (StopRun, GitError, MergeError, CiphertextError)
 
 
-def _push(ctx: Ctx) -> int:
-    ctx.log.warn("push is not implemented yet")
-    return 0
-
-
 def _status(ctx: Ctx) -> int:
     print("not implemented")
     return 0
@@ -38,7 +33,7 @@ def _dry_run(ctx: Ctx) -> int:
     return 0
 
 
-HANDLERS = {"pull": pull.run_pull, "push": _push, "status": _status, "dry-run": _dry_run}
+HANDLERS = {"pull": pull.run_pull, "push": push.run_push, "status": _status, "dry-run": _dry_run}
 
 
 def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
