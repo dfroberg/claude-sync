@@ -281,8 +281,9 @@ the filter does not run (verified, see 6.7 step 7).
    writes, so a file replaced by a directory of the same name, or the reverse, lands
    cleanly. A type clash on one path (`EISDIR` or `ENOTDIR`: a local directory where the
    remote has a file, or a local file where the remote needs a directory) turns that path
-   into a keep-both (the remote copy goes to `conflicts/`; if even that fails, an ERROR
-   line names the path), and the run continues with the next path. Any other filesystem
+   into a keep-both (the remote copy goes to `conflicts/`), and the run continues with the
+   next path. If writing that copy fails, the run stops like any other error below, so the
+   base never advances past a remote version that was not saved. Any other filesystem
    error (disk full, permission denied, read-only file) stops the run with an ERROR naming
    the path, before the reset and the update-ref, so the base does not move and the next
    run retries; paths already written are then skipped as `L == R`. Parking such a path
