@@ -32,7 +32,9 @@ class PullEdgeTest(SyncTestCase):
         self.assertEqual(b.read("CLAUDE.md"), "# shared\n")
         self.assertFalse((b.repo / ".fresh-machine").exists())
         self.assertIsNotNone(b.base())
-        self.assertIn("1 conflicts kept both", r.stdout)
+        self.assertIn("1 files replaced by the remote version, local copies in ~/.claude-sync/conflicts/", r.stdout)
+        self.assertTrue(any(" WARN remote version taken: settings.json (new machine, local copy saved)" in ln
+                            for ln in b.log_lines()))
 
     def test_marker_survives_failed_first_pull(self):
         b = self._new_machine_with_local_files()

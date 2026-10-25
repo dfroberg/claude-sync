@@ -219,6 +219,30 @@ class ChecksTest(SyncTestCase):
         self.assertEqual(r.notice(home), "claude-sync: ERROR boom (see ~/.claude-sync/last-sync.log)")
         self.assertEqual(Report().first_error, None)
 
+    def test_report_notice_took_remote(self):
+        home = Path("/h/me")
+        folder = home / ".claude-sync" / "conflicts" / "2026-10-25T16-31-02Z"
+        r = Report()
+        r.took_remote = 3
+        r.conflicts_dir = folder
+        d = "~/.claude-sync/conflicts/2026-10-25T16-31-02Z"
+        self.assertEqual(r.notice(home), f"claude-sync: 3 files replaced by the remote version, "
+                         f"local copies in {d} (see last-sync.log)")
+        r.kept_both = 2
+        self.assertEqual(r.notice(home), f"claude-sync: 2 conflicts kept both and 3 files replaced by the "
+                         f"remote version, copies in {d} (see last-sync.log)")
+
+    def test_report_summary_took_remote_only_when_nonzero(self):
+        r = Report()
+        self.assertNotIn("replaced by remote", r.summary("pull", 1.0))
+        r.took_remote = 3
+        self.assertEqual(r.summary("pull", 1.0),
+                         "pull done in 1.0s: 0 remote changes, 0 written, 0 merged, 0 kept-both, 0 trashed"
+                         ", 3 replaced by remote")
+        self.assertEqual(r.summary("push", 1.0),
+                         "push done in 1.0s: 0 remote changes, 0 written, 0 merged, 0 kept-both, 0 trashed"
+                         ", 3 replaced by remote, 0 pushed")
+
     def test_ctx_roots_and_checkpoint(self):
         m = self.machine("a")
         ctx = self.ctx(m)

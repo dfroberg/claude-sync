@@ -22,6 +22,7 @@ class Report:
     written: int = 0
     merged: int = 0
     kept_both: int = 0
+    took_remote: int = 0
     trashed: int = 0
     local_wins: int = 0
     pushed: int = 0
@@ -40,6 +41,8 @@ class Report:
         line = (f"{command} done in {seconds:.1f}s: {self.remote_changes} remote changes, "
                 f"{self.written} written, {self.merged} merged, {self.kept_both} kept-both, "
                 f"{self.trashed} trashed")
+        if self.took_remote:
+            line += f", {self.took_remote} replaced by remote"
         if command == "push":
             line += f", {self.pushed} pushed"
         return line
@@ -47,9 +50,16 @@ class Report:
     def notice(self, home: Path) -> Optional[str]:
         if self.errors:
             return f"claude-sync: ERROR {self.first_error} (see ~/.claude-sync/last-sync.log)"
+        where = _tilde(self.conflicts_dir, home)
+        if self.kept_both and self.took_remote:
+            return (f"claude-sync: {self.kept_both} conflicts kept both and {self.took_remote} files "
+                    f"replaced by the remote version, copies in {where} (see last-sync.log)")
         if self.kept_both:
             return (f"claude-sync: {self.kept_both} conflicts kept both, remote copies in "
-                    f"{_tilde(self.conflicts_dir, home)} (see last-sync.log)")
+                    f"{where} (see last-sync.log)")
+        if self.took_remote:
+            return (f"claude-sync: {self.took_remote} files replaced by the remote version, "
+                    f"local copies in {where} (see last-sync.log)")
         if self.local_wins:
             return f"claude-sync: {self.local_wins} local edits kept over remote deletes (see last-sync.log)"
         return None

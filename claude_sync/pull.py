@@ -263,8 +263,8 @@ def _apply_outcome(ctx: Ctx, outcome: Outcome, local: Path, local_rel: str, R: O
         # never replaced without a saved copy (spec 6.9).
         copy_aside(local, ctx.conflicts_root, local_rel)
         atomic_write(local, decanon_content(local_rel, R, me))
-        log.warn(f"kept both: {local_rel} (new machine: remote version taken, local copy saved)")
-        report.kept_both += 1
+        log.warn(f"remote version taken: {local_rel} (new machine, local copy saved)")
+        report.took_remote += 1
         report.conflicts_dir = ctx.conflicts_root
     else:
         raise StopRun(f"unexpected action {act.value} for {local_rel}")
