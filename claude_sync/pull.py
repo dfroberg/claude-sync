@@ -10,9 +10,10 @@ from claude_sync.checks import StopRun, prepare
 from claude_sync.context import BASE_REF, PENDING_REF, Ctx
 from claude_sync.decide import Act, Outcome, decide
 from claude_sync.fsops import (
-    atomic_write, is_ciphertext, move_aside, put_aside, read_content, stat_key,
+    atomic_write, copy_aside, is_ciphertext, move_aside, put_aside, read_content, stat_key,
 )
 from claude_sync.gitio import Change
+from claude_sync.merge import MergeError
 from claude_sync.paths import (
     Content, canon_content, decanon_content, safe_rel, to_local, under, via_symlink,
 )
@@ -20,6 +21,8 @@ from claude_sync.paths import (
 REGULAR_MODES = ("100644", "100755")
 REPLACING = (Act.WRITE, Act.TRASH, Act.TAKE_REMOTE)
 MAX_REDECIDE = 3
+MASS_DELETE_MIN = 20
+FRESH_MARKER = ".fresh-machine"
 
 
 def fetch_origin(ctx: Ctx) -> Optional[str]:
@@ -139,7 +142,10 @@ def _decide_path(ctx: Ctx, local: Path, local_rel: str, B: Optional[Content], R:
     while True:
         key = stat_key(local)               # before the read: a later change then always shows
         L = _read_local(ctx, local, local_rel)
-        outcome = decide(local_rel, L, B, R, fresh)
+        try:
+            outcome = decide(local_rel, L, B, R, fresh)
+        except MergeError as e:
+            raise StopRun(f"merge failed for {local_rel}: {e}")
         if outcome.act not in REPLACING:
             return outcome
         ctx.checkpoint("pull:before-replace")
@@ -161,12 +167,14 @@ def pull_steps(ctx: Ctx, origin: str) -> None:
     fresh = False
     if base is None:
         merge_base = git.empty_tree()
+        fresh = (cfg.repo / FRESH_MARKER).exists()
     else:
         merge_base = base
         if not git.is_ancestor(base, origin):
             log.info("remote history was rewritten")
     changes = git.diff_raw(merge_base, origin)
     report.remote_changes = len(changes)
+    _mass_delete_guard(ctx, origin, changes)
     placed, dropped = _check_changes(changes, me)
 
     remote = _load_remote(ctx, origin, [c for c, _ in placed])
@@ -193,9 +201,37 @@ def pull_steps(ctx: Ctx, origin: str) -> None:
     git.reset_hard(origin)
     ctx.checkpoint("pull:before-base")
     git.update_ref(BASE_REF, origin)
+    (cfg.repo / FRESH_MARKER).unlink(missing_ok=True)
+
+
+def _mass_delete_guard(ctx: Ctx, origin: str, changes: List[Change]) -> None:
+    """Spec 6.7 step 6: more than 20 deletes that also outnumber the files left in origin's data/."""
+    deletes = sum(1 for c in changes if c.status == "D")
+    if deletes <= MASS_DELETE_MIN or ctx.cfg.allow_prune:
+        return
+    kept = len(ctx.git.tree_blobs(origin))
+    if deletes > kept:
+        raise StopRun(f"remote deletes {deletes} files and keeps {kept}; "
+                      "run CLAUDE_SYNC_ALLOW_PRUNE=1 claude-sync pull if intended")
 
 
 def _apply(ctx: Ctx, outcome: Outcome, local: Path, local_rel: str, R: Optional[Content]) -> None:
+    try:
+        _apply_outcome(ctx, outcome, local, local_rel, R)
+    except (OSError, ValueError) as e:
+        # Any filesystem error that is not a type clash stops the run before the base moves (spec 6.7 step 8).
+        raise StopRun(f"cannot write {local_rel}: {getattr(e, 'strerror', None) or e}")
+
+
+def _keep_both(ctx: Ctx, local_rel: str, R: Optional[Content], note: str = "") -> None:
+    assert R is not None
+    put_aside(ctx.conflicts_root, local_rel, decanon_content(local_rel, R, ctx.cfg.me))
+    ctx.log.warn(f"kept both: {local_rel}{note}")
+    ctx.report.kept_both += 1
+    ctx.report.conflicts_dir = ctx.conflicts_root
+
+
+def _apply_outcome(ctx: Ctx, outcome: Outcome, local: Path, local_rel: str, R: Optional[Content]) -> None:
     me, log, report = ctx.cfg.me, ctx.log, ctx.report
     act = outcome.act
     if act is Act.NOTHING:
@@ -204,7 +240,12 @@ def _apply(ctx: Ctx, outcome: Outcome, local: Path, local_rel: str, R: Optional[
         log.warn(f"{outcome.warn}: {local_rel}")
     if act is Act.WRITE:
         assert outcome.content is not None
-        atomic_write(local, decanon_content(local_rel, outcome.content, me))
+        try:
+            atomic_write(local, decanon_content(local_rel, outcome.content, me))
+        except (IsADirectoryError, NotADirectoryError):
+            log.warn(f"type clash at {local_rel}")
+            _keep_both(ctx, local_rel, R)
+            return
         report.written += 1
         if outcome.merged:
             report.merged += 1
@@ -215,9 +256,14 @@ def _apply(ctx: Ctx, outcome: Outcome, local: Path, local_rel: str, R: Optional[
         if outcome.local_win:
             report.local_wins += 1
     elif act is Act.KEEP_BOTH:
+        _keep_both(ctx, local_rel, R)
+    elif act is Act.TAKE_REMOTE:
         assert R is not None
-        put_aside(ctx.conflicts_root, local_rel, decanon_content(local_rel, R, me))
-        log.warn(f"kept both: {local_rel}")
+        # The local file is copied (it stays in place) before the remote file replaces it, so it is
+        # never replaced without a saved copy (spec 6.9).
+        copy_aside(local, ctx.conflicts_root, local_rel)
+        atomic_write(local, decanon_content(local_rel, R, me))
+        log.warn(f"kept both: {local_rel} (new machine: remote version taken, local copy saved)")
         report.kept_both += 1
         report.conflicts_dir = ctx.conflicts_root
     else:
