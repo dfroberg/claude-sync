@@ -237,12 +237,12 @@ def test_mapping(self):
 def test_is_text(self): ...                        # .md .JSON .sh True; .png .bin False
 def test_scan_collects_allowlist_only(self): ...   # FILES, a skill, an agent, a memory file; skips plugins/, transcripts, *.sync-tmp.* files
 def test_scan_skips_symlinked_dirs(self):          # Review Focus 2
-    # skills/linked -> outside dir holding SKILL.md; skills/real/SKILL.md regular
+    # skills/linked is a symlink to an outside dir holding SKILL.md; skills/real/SKILL.md regular
     files, skipped = scan_local(claude, "alice")
     self.assertIn("skills/real/SKILL.md", files)
     self.assertNotIn("skills/linked/SKILL.md", files)
     self.assertIn("skills/linked/", skipped)
-def test_scan_follows_top_level_file_symlink(self): ...   # CLAUDE.md -> elsewhere/real.md is collected
+def test_scan_follows_top_level_file_symlink(self): ...   # CLAUDE.md as a symlink to elsewhere/real.md is collected
 def test_via_symlink(self): ...                    # True under skills/linked/, False for skills/real/x, False for CLAUDE.md symlink
 ```
 `tests/test_fsops.py`:
@@ -570,7 +570,7 @@ def test_pending_landed_moves_base(self):                  # spec test 27, refs 
 def test_exec_bit_chmod_only_pulled(self): ...             # spec test 25, pull half
 def test_both_added_bit_difference_no_base(self): ...      # keeps local bit; with marker, remote bit
 def test_pull_never_writes_through_symlinked_dir(self):    # Review Focus 2
-    # local skills/linked -> outside dir; remote_commit adds skills/linked/SKILL.md
+    # local skills/linked is a symlink to an outside dir; remote_commit adds skills/linked/SKILL.md
     a.run("pull")
     self.assertFalse((outside / "SKILL.md").exists())
 def test_rewritten_remote_history(self): ...               # remote force-reset to an older commit plus a new one: INFO line, merge-base used, exit 0
@@ -661,7 +661,7 @@ def test_legacy_lock_dir(self): ...                       # spec test 19 integra
 ```
 - [ ] **Step 2: Run to verify they fail**: `python3 -m unittest tests.test_cli -v`.
 - [ ] **Step 3: Implement in `cli.py`; rewrite the README sections.**
-- [ ] **Step 4: Run to verify they pass**, then the whole suite under both interpreters, then `grep -nE '—|–|→|←|->|=>' README.md` (expected: no output).
+- [ ] **Step 4: Run to verify they pass**, then the whole suite under both interpreters, then `python3 -c "import re,sys; sys.exit(bool(re.search(r'\u2014|\u2013|\u2192|\u2190|-[>]|=[>]', open('README.md').read())))"` (expected: exit 0).
 - [ ] **Step 5: Commit**: `git commit -m "feat: add status, dry-run, retention and README for the rewrite"`
 
 ---
