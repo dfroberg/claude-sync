@@ -19,12 +19,22 @@ def is_ciphertext(data: bytes) -> bool:
 
 
 def read_content(path: Path) -> Optional[Content]:
+    # O_NOFOLLOW: a path that became a symlink after the caller's via_symlink check raises
+    # OSError (ELOOP) instead of reading the target (spec 6.3).
     try:
-        with open(path, "rb") as fh:
-            mode = os.fstat(fh.fileno()).st_mode
-            data = fh.read()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
         return None
+    try:
+        mode = os.fstat(fd).st_mode
+    except BaseException:
+        os.close(fd)
+        raise
+    if stat.S_ISDIR(mode):
+        os.close(fd)
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read()
     return Content(data, bool(mode & stat.S_IXUSR))
 
 

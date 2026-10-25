@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import tempfile
@@ -50,6 +51,17 @@ class FsopsTest(unittest.TestCase):
         (d / "x.sh").write_bytes(b"abc")
         (d / "x.sh").chmod(0o755)
         self.assertEqual(read_content(d / "x.sh"), Content(b"abc", True))
+        (d / "target.txt").write_text("secret target")
+        os.symlink(d / "target.txt", d / "link")
+        with self.assertRaises(OSError) as cm:
+            read_content(d / "link")
+        self.assertEqual(cm.exception.errno, errno.ELOOP)
+        os.symlink(d / "dir", d / "dirlink")
+        with self.assertRaises(OSError):
+            read_content(d / "dirlink")
+        os.symlink(d / "nowhere", d / "dangling")
+        with self.assertRaises(OSError):
+            read_content(d / "dangling")
         if os.geteuid() != 0:
             (d / "secret").write_text("s")
             (d / "secret").chmod(0)
