@@ -177,6 +177,21 @@ class GitioTest(SyncTestCase):
         g2 = Git(m.repo, self.log, base_env=m.env(GIT_DIR=str(other / ".git"), GIT_WORK_TREE=str(other),
                                                   GIT_INDEX_FILE=str(other / ".git/index")))
         self.assertEqual(g2.rev("HEAD"), m.git("rev-parse", "HEAD"))
+        g3 = Git(m.repo, self.log, base_env=m.env(
+            GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=str(other),
+            GIT_CONFIG_PARAMETERS="'core.bare'='true'"))
+        self.assertEqual(g3.run("config", "core.hooksPath").stdout.strip(), b"/dev/null")  # injected config ignored
+
+    def test_env_strip_list(self):
+        g = Git(self.m.repo, self.log, base_env=self.m.env(
+            GIT_CONFIG_PARAMETERS="'x.y'='z'", GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="a.b",
+            GIT_CONFIG_VALUE_0="c", GIT_CONFIG_KEY_17="d.e", GIT_CONFIG_VALUE_17="f",
+            GIT_ASKPASS="/bin/echo", SSH_ASKPASS="/bin/echo", GIT_SSH_COMMAND="ssh -v", GIT_DIR="/x"))
+        env = g._env(None)
+        for k in ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+                  "GIT_CONFIG_KEY_17", "GIT_CONFIG_VALUE_17", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_DIR"):
+            self.assertNotIn(k, env)
+        self.assertEqual(env["GIT_SSH_COMMAND"], "ssh -v")  # the user's own choice is kept
 
     def test_optional_queries_do_not_raise(self):
         g, m = self.g, self.m

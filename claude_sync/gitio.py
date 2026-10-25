@@ -18,12 +18,21 @@ from claude_sync.log import Log
 STRIPPED_ENV = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_ASKPASS", "SSH_ASKPASS",
 )
+STRIPPED_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 OFFLINE_PATTERNS = (
     "could not resolve host", "network is unreachable", "connection timed out",
     "connection refused", "operation timed out", "ssh: connect to host",
 )
 REJECT_PATTERNS = ("[rejected]", "non-fast-forward", "fetch first", "stale info")
+
+
+def strip_git_env(env: Dict[str, str]) -> None:
+    """Remove the inherited repository, config-injection and askpass variables in place (spec 6.2)."""
+    for k in list(env):
+        if k in STRIPPED_ENV or k.startswith(STRIPPED_PREFIXES):
+            del env[k]
 
 
 class GitError(Exception):
@@ -68,8 +77,7 @@ class Git:
 
     def _env(self, extra: Optional[Mapping[str, str]]) -> Dict[str, str]:
         env = dict(self.base_env if self.base_env is not None else os.environ)
-        for k in STRIPPED_ENV:
-            env.pop(k, None)
+        strip_git_env(env)
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["LC_ALL"] = "C"
         env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")

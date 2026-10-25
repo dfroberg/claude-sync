@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from claude_sync.gitio import STRIPPED_ENV
+from claude_sync.gitio import strip_git_env
 from claude_sync.paths import Content, is_text
 
 _LINK = re.compile(rb"\]\(([^)]+\.md)\)")
@@ -27,8 +27,7 @@ def links(data: bytes) -> Set[str]:
 def _env() -> Dict[str, str]:
     # The same cleaning as Git.run: no inherited repository variables, no prompts, C locale.
     env = dict(os.environ)
-    for k in STRIPPED_ENV:
-        env.pop(k, None)
+    strip_git_env(env)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["LC_ALL"] = "C"
     return env

@@ -143,13 +143,18 @@ class MergeTest(unittest.TestCase):
             seen["argv"], seen["env"] = argv, kw.get("env")
             return real(argv, **kw)
 
-        with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent", "GIT_INDEX_FILE": "/nonexistent"}):
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent", "GIT_INDEX_FILE": "/nonexistent",
+                                         "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "c",
+                                         "GIT_CONFIG_PARAMETERS": "'a.b'='c'", "GIT_ASKPASS": "x", "SSH_ASKPASS": "y"}):
             with mock.patch("claude_sync.merge.subprocess.run", side_effect=spy):
                 merge_text(b"a\n", b"a\n", b"a\n", False)
         self.assertIsInstance(seen["argv"], list)
         self.assertNotIn("GIT_DIR", seen["env"])
         self.assertNotIn("GIT_INDEX_FILE", seen["env"])
         self.assertNotIn("XDG_CONFIG_HOME", seen["env"])
+        for k in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS",
+                  "GIT_ASKPASS", "SSH_ASKPASS"):
+            self.assertNotIn(k, seen["env"])
         self.assertEqual(seen["argv"][:3], ["git", "merge-file", "-p"])
 
 
