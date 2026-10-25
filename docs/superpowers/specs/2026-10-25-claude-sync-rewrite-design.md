@@ -407,8 +407,9 @@ the same as today's and is not solved here.
 - `*.json`: the merged result must parse with `json.loads` with duplicate keys rejected
   (an `object_pairs_hook` that raises on a repeated key), otherwise keep-both. A line
   merge in which both sides added the same key would otherwise pass with one value
-  silently dropped. Any JSON content is parsed again just before it replaces a local
-  file. Invalid JSON is never written.
+  silently dropped. A merged JSON result is never written unless it passed this check.
+  A remote version taken whole (the local file unchanged) is written as the other Mac
+  has it, so a `.json` file with comments, which strict parsing rejects, still syncs.
 - Binary files (not in the text list), or text with conflicting hunks: keep-both.
 - Keep-both: the local file stays as it is. The remote version, decanonicalised, goes to
   `$REPO/conflicts/<stamp>/<path relative to ~/.claude>` (stamp as in 6.8). Logged as
@@ -890,7 +891,7 @@ accepted in part and 2 rejected, with reasons below.
 | M2 | Major | Pending resolution was not an algorithm and could commit on the wrong parent. | Accepted in part. 6.4: save the commit, `reset --hard` to it, move the base, delete the ref last. 6.10 step 4: rescan whenever the base moved. Kept: push's no-change exit before the fetch (the next fetching run resolves pending), so the timer stays cheap. |
 | M3 | Major | The restore check does not see ignored leftovers. | Accepted. 6.4: `git clean -qfdx -- data` runs on every locked run. Test 26. |
 | M4 | Major | `status` and `dry-run` scanned without the unlock or the restore. | Accepted. 6.12: `status` prints "locked" or "unknown" instead of a wrong count; `dry-run` takes the lock and runs the 6.6 checks. Test 38. |
-| M5 | Major | `json.loads` accepts duplicate keys, and test 6 accepted a destructive result. | Accepted in part. 6.9: duplicate keys rejected, JSON parsed again before replace. Test 6 asserts both sides' keys. A full key-survival check was not added: a clean line merge drops a key only when one side deleted it. |
+| M5 | Major | `json.loads` accepts duplicate keys, and test 6 accepted a destructive result. | Accepted in part. 6.9: a merged JSON result with a duplicate key is rejected (keep-both). A remote version taken whole is still written as is, so `.json` files with comments keep syncing. Test 6 asserts both sides' keys. A full key-survival check was not added: a clean line merge drops a key only when one side deleted it. |
 | M6 | Major | Two mass delete predicates, and "kept" was undefined. | Accepted. One predicate in 6.7 step 6, used by 6.10 step 6: more than 20 deletes and more deletes than files left under `data/` in the destination tree. A folder rename passes, so no rename detection is needed. |
 | M7 | Major | With rewritten history, a merge-base diff misses paths that differ between the base and `O`. | Accepted, with a simpler fix than proposed: `M` is always the base (6.7 step 4). A tree diff needs no ancestry, so merge-base and its ERROR are gone. |
 | M8 | Major | "Treat as a conflict" after the race retries was undefined, and trash moves had no re-stat. | Accepted in part. 6.8: keep-both after 3 attempts; trash moves re-stat too. Not taken: holding the path back from the next push; the partial-write risk is stated in 6.8 and is today's. |
