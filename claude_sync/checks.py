@@ -77,6 +77,10 @@ def _is_locked(ctx: Ctx) -> bool:
     return False
 
 
+def is_locked(ctx: Ctx) -> bool:
+    return _is_locked(ctx)
+
+
 def ensure_unlocked(ctx: Ctx) -> None:
     cfg = ctx.cfg
     if not _uses_gitcrypt(cfg.repo) or not _is_locked(ctx):
