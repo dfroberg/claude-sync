@@ -269,7 +269,11 @@ No base ref (the first run of the new code on a machine, for migration or a new 
    `.git/packed-refs.lock` older than 60 s (we hold the lock, so they belong to a killed
    run), with a WARN line each. When this run kills a git command at its timeout, it
    removes those lock files at once, whatever their age, since the killed child was the
-   only git process allowed to hold them.
+   only git process allowed to hold them. A `.git/index.lock` younger than 60 s that is
+   still there afterwards means another git process is running: a git child runs in its
+   own session, so it can outlive a run killed by a hook timeout and still be rewriting
+   `data/`. The run then logs INFO `git busy` and exits 0 without reading or writing
+   anything (round 3, finding 2).
 2. Remove `.git/rebase-merge` and `.git/rebase-apply` left by the old code, with a WARN
    line. If the directory holds an `autostash` file, first run
    `git stash store -m "autostash of a killed sync run" <its sha>` (as bin/claude-sync
@@ -461,7 +465,8 @@ the same as today's and is not solved here.
    0.
 5. Empty-file guard: a 0-byte local file whose base version is not empty is never pushed.
    If its mtime is older than 10 minutes it is restored from base with a WARN (the empty
-   file is moved to trash first; the restore is decanonicalised and takes the base's exec
+   file is copied to trash first and then replaced in place, so a kill between the two
+   never leaves the path missing; the restore is decanonicalised and takes the base's exec
    bit); a younger one may be a write in progress and is left alone.
 6. Local mass delete guard: more than 20 deletions, and the deletions also outnumber the
    files that would remain under `data/` after the push (the predicate of 6.7 step 6):
@@ -505,6 +510,9 @@ no autostash, no merge commits.
   and the pull steps inside push). Everything else is an ERROR.
 - Exit codes: 0 for success, skip or offline; 1 for an error. Hooks keep `|| true`.
 - An uncaught exception is logged with its traceback and exits 1.
+- SIGTERM or SIGHUP (a hook timeout, a closed session) ends the run through the normal
+  exit path: the running git child and its process group are killed, a WARN
+  `terminated by signal` is logged, and the exit code is 128 plus the signal number.
 - stdout notice: plain text, one line, at most 200 characters, only when there is
   something to act on (kept-both conflicts, local-edit-beats-delete, ERROR, or the shim
   finding no usable python). Example:
@@ -738,8 +746,9 @@ Code first, nix second, never the other way round (section 7).
    no new loss for it. `HEAD..origin/main` is not enough as a check, because the old
    push moves `HEAD` without applying.) Anything that still differs
    on both sides at its first new-code run has no base to merge against: the local copy
-   stays and the remote copy goes to `conflicts/` (6.4). The last old-code pull, which
-   brings in the new code, still runs the old `apply()` once.
+   stays and the remote copy goes to `conflicts/` (6.4). On the main Mac, step 4 brings
+   in the new code without a last old pull; on the second Mac the last old-code pull,
+   which brings in the new code, still runs the old `apply()` once.
    Do not run the old push on the second Mac (Dannys-MacBook-Pro, 5 of the 3596 sync
    commits): the old push never applies, so it would send that Mac's stale copies over
    the main Mac's (section 2 item 2). Its 5 minute timer runs the old push only when
@@ -749,19 +758,36 @@ Code first, nix second, never the other way round (section 7).
    code always has, and brings in the new code; its first new-code run finds local equal
    to the remote. If it holds local work that must survive, copy that work aside before
    that session start.
-3. Merge the branch into `main` of `dfroberg/claude-sync` and push. This touches only
-   `bin/`, `claude_sync/`, `tests/`, `docs/`, `README.md` (new-machine steps gain the
-   `touch .fresh-machine` line) and `.gitignore`; `data/` is not changed.
-4. On each Mac, once a pull has brought in the new code (any session start), run
-   `claude-sync pull` by hand so the first new-code run happens at once and sets the
-   base. Check `claude-sync status`, the log and any notice.
+3. Push the branch `dfroberg/TO-772-ignore-first` to `main` first. It is one commit on
+   top of `main` that changes only `.gitignore` (adds `conflicts/`, `trash/`,
+   `.sync.lock`, `.fresh-machine`, `last-sync.log.1`, `.hold-*` and the temporary file
+   patterns) and `.gitattributes` (encrypts `conflicts/**` and `trash/**`). Then merge
+   the rewrite branch into `main` of `dfroberg/claude-sync` and push. The merge touches
+   only `bin/`, `claude_sync/`, `tests/`, `docs/`, `README.md` (new-machine steps gain the
+   `touch .fresh-machine` line), `.gitignore` and `.gitattributes`; `data/` is not
+   changed. The order matters for the rollback below: reverting the merge keeps the
+   ignore-first commit, so the old tool's `git add -A` never picks up parked plaintext.
+4. Main Mac (EZ-MBP-GD4RPHKWL4), right after step 3, with no Claude session starting:
+   do not let a session start bring in the new code, because that runs the old pull's
+   `apply()` once more and writes the remote's copies over edits made since step 2. Run
+   `git -C ~/.claude-sync fetch -q origin && git -C ~/.claude-sync reset --hard -q origin/main`
+   and then `claude-sync pull` (now the new code). Files that changed since step 2 differ
+   on both sides with no base: the local copy stays and the remote copy is parked
+   (6.4), so nothing is lost. Second Mac (Dannys-MacBook-Pro): once a pull has brought
+   in the new code (any session start, as step 2 describes), run `claude-sync pull` by
+   hand so the first new-code run happens at once and sets the base. On both Macs check
+   `claude-sync status`, the log and any notice.
 5. Only on a Mac where step 4 is done: merge the dotnix branch and switch there.
 6. Watch for a week: `find ~/.claude/projects/*/memory -type f -size 0` stays empty, no
    unexpected `conflicts/` folders, no ERROR lines.
 
 Rollback: if the nix change was switched, switch back to the previous home-manager
 generation first (the old code with the new hooks is the bad pairing in section 7). Then
-revert the merge on `main` and push; each Mac returns to the old code on its next pull. If
+revert the merge commit only (never the ignore-first commit of step 3) on `main` and
+push; each Mac returns to the old code on its next pull. Before the first old-code push
+on each Mac, move `~/.claude-sync/conflicts` and `~/.claude-sync/trash` out of the repo
+(for example to `~/claude-sync-parked/`): they hold plaintext copies, and the ignore and
+encrypt entries are the only thing between them and the old push's `git add -A`. If
 the new code cannot pull at all:
 `git -C ~/.claude-sync fetch origin && git -C ~/.claude-sync reset --hard origin/main`.
 The old code ignores `refs/claude-sync/base`, `refs/claude-sync/pending`, `.sync.lock`
@@ -819,6 +845,16 @@ or sharpen approved behaviour:
   sync carries on from the base with an INFO line instead of stopping with an ERROR.
 - JSON merges with a key added on both sides become a keep-both instead of a silent pick.
 - A remote entry that is a symlink or a submodule stops the sync with an ERROR.
+
+Changes made after the owner's approval, from the final Fable gate on the built branch
+(section 12, round 3):
+- Rollout step 3 now lands a separate ignore-first commit before the merge, and the
+  rollback reverts the merge only and moves the parked folders out of the repo. Parked
+  folders are also marked for encryption.
+- Rollout step 4 on the main Mac brings in the new code with a fetch and a reset instead
+  of a last old pull, so the old `apply()` never runs there again.
+- A young `.git/index.lock` makes a run skip (INFO `git busy`, exit 0) instead of
+  proceeding (6.6 step 1). SIGTERM and SIGHUP kill the running git child (6.11).
 
 ## 12. Adversarial review
 
@@ -936,3 +972,18 @@ plan wording; the design changes it prompted:
 - 6.8: the race fallback for a remote delete keeps the local file (nothing to park), and
   reads never follow a symlink.
 The plan's record lists every item and its resolution.
+
+### Round 3: Fable final gate on the built branch
+
+One Fable pass over the whole branch (code at 09fadbac) and the dotnix commit 0dec33c,
+against this design. Verdict: NOT READY (1 critical, 1 major, 4 minor). All six were
+verified in the code and fixed:
+
+| # | Sev | Finding | Resolution |
+|---|-----|---------|------------|
+| 1 | Critical | The documented rollback (revert the merge) also reverts the new `.gitignore`; the old tool's push runs `git add -A` and would commit `conflicts/` and `trash/` (plaintext copies) to the public remote. | Accepted. A separate ignore-first commit (branch `dfroberg/TO-772-ignore-first`, `.gitignore` and `.gitattributes` only) lands on `main` before the merge; the rollback reverts the merge only and moves the parked folders out of the repo first; `.gitattributes` encrypts `conflicts/**` and `trash/**` (section 9). |
+| 2 | Major | A git child runs in its own session, so after a hook timeout kills a pull it can keep rewriting `data/` while the next run, which keeps young lock files, reads `data/` as the base and merges against a half-written base. | Accepted. A young `.git/index.lock` makes the run skip with INFO `git busy` (6.6 step 1); SIGTERM and SIGHUP raise through the normal exit path, which kills the child's process group (6.11). Tests `test_young_index_lock_skips_pull`, `test_sigterm_kills_git_child`. |
+| 3 | Minor | The empty-file guard moved the file to trash before writing the restore; a kill between the two left the path missing, and the next push would publish a delete. | Accepted. Copy to trash, then replace in place (6.10 step 5). Test `test_empty_file_guard_crash_keeps_path`. |
+| 4 | Minor | Equal content with only the exec bit different became a keep-both for a non-text file, against 6.8's own rule for the bit. | Accepted. Equal content takes the bit from the three-way exec rule, for every file type. Five tests in `test_decide.py`. |
+| 5 | Minor | The hooks ensure script skipped symlinked Orca profile settings but not a symlinked `~/.claude/settings.json`. | Accepted. Both are skipped (dotnix commit cece391). Not the case on this Mac today. |
+| 6 | Minor | On the main Mac, the session start that brings in the new code still ran the old pull's `apply()`, writing the remote's copies over edits made since step 2. | Accepted. Section 9 step 4: fetch and reset, then the new pull, on the main Mac. |
