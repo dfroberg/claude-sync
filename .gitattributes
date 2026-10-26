@@ -2,3 +2,8 @@
 # The script, manifest, and README stay plaintext so a fresh machine can run
 # `claude-sync` and `git-crypt unlock` before anything is decrypted.
 data/** filter=git-crypt diff=git-crypt
+
+# Parked copies (conflicts/, trash/) are ignored, so they never reach the public remote.
+# If one is ever added by hand or by an older tool, it is still encrypted.
+conflicts/** filter=git-crypt diff=git-crypt
+trash/** filter=git-crypt diff=git-crypt
