@@ -82,6 +82,16 @@ class CliTest(SyncTestCase):
         self.assertEqual(values["conflict folders"], "1")
         self.assertEqual(values["pending"], "yes")
 
+    def test_status_leaves_index_untouched(self):
+        a, = self.synced("a")
+        tracked = a.repo / "data" / "CLAUDE.md"
+        st = tracked.stat()
+        os.utime(tracked, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))      # newer mtime, same bytes
+        index = a.repo / ".git" / "index"
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        a.run("status")
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+
     def test_status_with_no_base_says_none(self):
         a = self.machine("a")
         values = dict(fields(a.run("status").stdout))

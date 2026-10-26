@@ -182,6 +182,13 @@ class GitioTest(SyncTestCase):
             GIT_CONFIG_PARAMETERS="'core.bare'='true'"))
         self.assertEqual(g3.run("config", "core.hooksPath").stdout.strip(), b"/dev/null")  # injected config ignored
 
+    def test_optional_locks_off(self):
+        env = self.m.env()
+        env.pop("GIT_OPTIONAL_LOCKS", None)
+        self.assertNotIn("GIT_OPTIONAL_LOCKS", Git(self.m.repo, self.log, base_env=env)._env(None))
+        off = Git(self.m.repo, self.log, base_env=env, optional_locks=False)
+        self.assertEqual(off._env(None)["GIT_OPTIONAL_LOCKS"], "0")
+
     def test_env_strip_list(self):
         g = Git(self.m.repo, self.log, base_env=self.m.env(
             GIT_CONFIG_PARAMETERS="'x.y'='z'", GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="a.b",

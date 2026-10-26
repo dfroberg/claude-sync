@@ -110,7 +110,8 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
     if env.get("CLAUDE_SYNC_RECONCILING") == "1":
         log.info("nested invocation; skipping")
         return 0
-    git = Git(cfg.repo, log, base_env=None if env is os.environ else env)
+    git = Git(cfg.repo, log, base_env=None if env is os.environ else env,
+              optional_locks=(command != "status"))
     report = Report()
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     ctx = Ctx(cfg=cfg, log=log, git=git, report=report, stamp=stamp)

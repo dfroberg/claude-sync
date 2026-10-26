@@ -69,10 +69,12 @@ def _blob(oid: str) -> Optional[str]:
 
 
 class Git:
-    def __init__(self, repo: Path, log: Log, base_env: Optional[Mapping[str, str]] = None) -> None:
+    def __init__(self, repo: Path, log: Log, base_env: Optional[Mapping[str, str]] = None,
+                 optional_locks: bool = True) -> None:
         self.repo = Path(repo)
         self.log = log
         self.base_env = base_env
+        self.optional_locks = optional_locks
         self._empty_tree: Optional[str] = None
 
     def _env(self, extra: Optional[Mapping[str, str]]) -> Dict[str, str]:
@@ -81,6 +83,8 @@ class Git:
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["LC_ALL"] = "C"
         env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+        if not self.optional_locks:
+            env["GIT_OPTIONAL_LOCKS"] = "0"
         if extra:
             env.update(extra)
         return env
