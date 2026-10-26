@@ -1,13 +1,16 @@
 """Start checks for every locked run (spec 6.6) and the invariant restore (spec 6.4)."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from claude_sync.context import BASE_REF, Ctx
 
 UNLOCK_TIMEOUT = 60
+LOCK_STALE_AGE = 60
 MAX_NAMED = 5
 
 
@@ -21,10 +24,16 @@ class SkipRun(Exception):
 
 def prepare(ctx: Ctx) -> None:
     git, log, cfg = ctx.git, ctx.log, ctx.cfg
-    for path in git.clear_locks(60):
+    for path in git.clear_locks(LOCK_STALE_AGE):
         log.warn(f"removed stale git lock {path}")
-    if (cfg.repo / ".git" / "index.lock").exists():
-        raise SkipRun("git busy: .git/index.lock is held by another git process; skipping")
+    try:
+        age = time.time() - os.lstat(cfg.repo / ".git" / "index.lock").st_mtime
+    except FileNotFoundError:
+        age = None
+    if age is not None:
+        if age < LOCK_STALE_AGE:
+            raise SkipRun("git busy: .git/index.lock is held by another git process; skipping")
+        raise StopRun("stale .git/index.lock could not be removed; remove it by hand")
     _clear_dead_rebase(ctx)
     _attach_head(ctx)
     dirty = git.dirty_outside_data()

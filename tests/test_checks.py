@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import unittest.mock
 from pathlib import Path
 
 from claude_sync import config
@@ -42,6 +43,17 @@ class ChecksTest(SyncTestCase):
         self.age(lock, 5)
         with self.assertRaises(SkipRun):
             prepare(self.ctx(m))
+        self.assertTrue(lock.exists())
+
+    def test_unremovable_stale_index_lock_stops(self):
+        m = self.machine("a")
+        lock = m.repo / ".git" / "index.lock"
+        lock.write_text("")
+        self.age(lock, 120)
+        with unittest.mock.patch("claude_sync.gitio.os.unlink", side_effect=PermissionError(13, "Permission denied")):
+            with self.assertRaises(StopRun) as cm:
+                prepare(self.ctx(m))
+        self.assertIn("could not be removed", str(cm.exception))
         self.assertTrue(lock.exists())
 
     def _dead_rebase(self, m, sha_text):
