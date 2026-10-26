@@ -154,6 +154,26 @@ class CliTest(SyncTestCase):
         self.assertEqual(a.git("diff", "--name-only", "HEAD~1", "HEAD"), f"data/{REPO}n.md")
         self.assertEqual(self.remote_tip(), a.git("rev-parse", "HEAD"))
 
+    def test_dry_run_says_when_git_is_busy(self):
+        a, = self.synced("a")
+        lock = a.repo / ".git" / "index.lock"
+        lock.write_text("")
+        t = time.time() - 5
+        os.utime(lock, (t, t))
+        r = a.run("dry-run")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(len(r.stdout.splitlines()), 1, r.stdout)
+        self.assertTrue(r.stdout.startswith("claude-sync: git busy"), r.stdout)
+
+    def test_dry_run_says_when_the_lock_is_busy(self):
+        a, = self.synced("a")
+        fd = os.open(a.repo / ".sync.lock", os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        r = a.run("dry-run", env=a.env(CLAUDE_SYNC_LOCK_WAIT="1"))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "claude-sync: another sync run holds the lock; dry-run checked nothing\n")
+
     # retention
 
     def test_retention(self):                                 # spec test 23

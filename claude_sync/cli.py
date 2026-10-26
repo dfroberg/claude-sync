@@ -131,6 +131,8 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
             wait = cfg.lock_wait_override if cfg.lock_wait_override is not None else LOCK_WAIT[command]
             fd = acquire(cfg.repo, wait, log)
             if fd is None:
+                if command == "dry-run":
+                    log.notice("claude-sync: another sync run holds the lock; dry-run checked nothing")
                 skipped = True
                 return 0
             ctx.lock_fd = fd
@@ -140,6 +142,8 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
         raise
     except SkipRun as e:
         log.info(str(e))
+        if command == "dry-run":
+            log.notice(f"claude-sync: {e}")
         report.noop = True
         rc = 0
     except EXPECTED_ERRORS as e:
