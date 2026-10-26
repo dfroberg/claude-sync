@@ -139,6 +139,8 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
         rc = HANDLERS[command](ctx)
     except SystemExit:
         log.warn("terminated by signal")
+        if ctx.lock_fd is not None:
+            git.clear_locks(0)
         raise
     except SkipRun as e:
         log.info(str(e))

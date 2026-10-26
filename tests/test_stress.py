@@ -147,3 +147,31 @@ class StressTest(SyncTestCase):
         self.assertTrue(any("terminated by signal" in ln for ln in a.log_lines()), a.log_lines())
         a.git("remote", "set-url", "origin", f"file://{self.remote}")
         self.assertEqual(a.run("pull").returncode, 0)
+
+    def test_sigterm_clears_git_locks(self):
+        a, = self.synced("a")
+        pidfile = self.root / "ssh.pid"
+        fake = self.root / "sleepssh"
+        fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}.tmp\nmv {pidfile}.tmp {pidfile}\nexec sleep 60\n")
+        fake.chmod(0o755)
+        a.git("remote", "set-url", "origin", "ssh://example.invalid/x")
+        p = self.spawn(a, "pull", env=a.env(GIT_SSH_COMMAND=str(fake)))
+        wait_for(pidfile)
+        ssh_pid = int(pidfile.read_text())
+
+        def reap_ssh():
+            try:
+                os.kill(ssh_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(reap_ssh)
+        lock = a.repo / ".git" / "index.lock"
+        lock.write_text("")                                      # stands in for the killed child's lock
+        os.kill(p.pid, signal.SIGTERM)
+        rc = p.wait(10)
+        self.assertEqual(rc, 143)
+        self.assertFalse(lock.exists())
+        a.git("remote", "set-url", "origin", f"file://{self.remote}")
+        before = len(a.log_lines())
+        self.assertEqual(a.run("pull").returncode, 0)
+        self.assertFalse(any(" INFO git busy" in ln for ln in a.log_lines()[before:]), a.log_lines())
