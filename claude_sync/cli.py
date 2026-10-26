@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -26,6 +27,10 @@ RETENTION_DAYS = 30
 TAIL_BYTES = 256 * 1024
 SUMMARY_LINE = re.compile(r" (pull|push) INFO (pull|push) done in ")
 UNKNOWN = "unknown (a run is in progress or was interrupted)"
+
+
+def _terminate(signum: int, _frame: object) -> None:
+    raise SystemExit(128 + signum)
 
 
 def _last_summary(ctx: Ctx) -> str:
@@ -119,6 +124,8 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
     started = time.monotonic()
     skipped = False
     rc = 0
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGHUP, _terminate)
     try:
         if locked:
             wait = cfg.lock_wait_override if cfg.lock_wait_override is not None else LOCK_WAIT[command]
@@ -128,6 +135,9 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
                 return 0
             ctx.lock_fd = fd
         rc = HANDLERS[command](ctx)
+    except SystemExit:
+        log.warn("terminated by signal")
+        raise
     except SkipRun as e:
         log.info(str(e))
         report.noop = True

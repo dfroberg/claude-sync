@@ -114,3 +114,36 @@ class StressTest(SyncTestCase):
         a.run("pull")
         self.assertEqual(a.read(LOCAL + "theirs.md"), "theirs\n")
         self.assertEqual(a.read(LOCAL + "mine.md"), "mine\n")
+
+    def test_sigterm_kills_git_child(self):
+        a, = self.synced("a")
+        pidfile = self.root / "ssh.pid"
+        fake = self.root / "sleepssh"
+        fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}.tmp\nmv {pidfile}.tmp {pidfile}\nexec sleep 60\n")
+        fake.chmod(0o755)
+        a.git("remote", "set-url", "origin", "ssh://example.invalid/x")
+        p = self.spawn(a, "pull", env=a.env(GIT_SSH_COMMAND=str(fake)))
+        wait_for(pidfile)
+        ssh_pid = int(pidfile.read_text())
+
+        def reap_ssh():
+            try:
+                os.kill(ssh_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(reap_ssh)
+        os.kill(p.pid, signal.SIGTERM)                           # p.pid is python: the shim execs it
+        rc = p.wait(10)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(ssh_pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() > deadline:
+                self.fail(f"the git child (pid {ssh_pid}) survived SIGTERM")
+            time.sleep(0.05)
+        self.assertEqual(rc, 143)
+        self.assertTrue(any("terminated by signal" in ln for ln in a.log_lines()), a.log_lines())
+        a.git("remote", "set-url", "origin", f"file://{self.remote}")
+        self.assertEqual(a.run("pull").returncode, 0)
