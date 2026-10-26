@@ -463,5 +463,25 @@ class PushTest(SyncTestCase):
         self.assertIsNone(a.ref(PENDING))      # `cat` as the clean filter also makes git see CLAUDE.md as modified
 
 
+    def test_root_only_ignores_do_not_hide_data_paths(self):
+        a, b = self.synced("a", "b")
+        files = {"skills/s/trash/t.md": "t\n", "skills/s/conflicts/c.md": "c\n",
+                 "skills/s/scripts/__pycache__/m.cpython-39.pyc": b"\x00\x01pyc"}
+        for rel, data in files.items():
+            a.write(rel, data)
+        a.run("push")
+        self.assertEqual(sorted(set(files) & set(self.remote_paths())), sorted(files))
+        b.run("pull")
+        for rel, data in files.items():
+            self.assertEqual((b.claude / rel).read_bytes(), data.encode() if isinstance(data, str) else data)
+
+        def ignored(rel):
+            cp = subprocess.run(["git", "-C", str(a.repo), "check-ignore", "-q", rel], env=a.env())
+            return cp.returncode == 0
+        for rel in ("conflicts/x", "trash/x", "claude_sync/__pycache__/x.pyc", ".fresh-machine", ".sync.lock"):
+            self.assertTrue(ignored(rel), rel)
+        for rel in ("data/skills/s/trash/t.md", "data/skills/s/scripts/__pycache__/m.cpython-39.pyc"):
+            self.assertFalse(ignored(rel), rel)
+
 if __name__ == "__main__":
     unittest.main()
