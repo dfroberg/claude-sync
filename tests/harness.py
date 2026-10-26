@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import random
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 FORBIDDEN = [REAL_HOME / ".claude", REAL_HOME / ".claude-sync", REAL_HOME / ".config" / "git-crypt"]
@@ -65,6 +66,43 @@ def wait_for(path: Path, timeout: float = 30) -> None:
     raise AssertionError(f"timed out after {timeout}s waiting for {path}")
 
 
+def fixture_files(memory_files: int, skill_files: int, total_bytes: int,
+                  hooks: int = 5) -> List[Tuple[str, bytes, bool]]:
+    """Deterministic repo files (path under data/, bytes, exec bit) shaped like the live data.
+
+    Memory files sit in 15 projects, the first of each is a MEMORY.md index; skills sit in 60 folders;
+    a few hooks/*.sh carry the exec bit. Sizes vary around total_bytes / file count.
+    """
+    rng = random.Random(772)
+    words = ["".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(3, 9))) for _ in range(500)]
+    pool = [" ".join(rng.choice(words) for _ in range(rng.randint(6, 14))) + "\n" for _ in range(3000)]
+    avg = total_bytes // (memory_files + skill_files + hooks)
+
+    def body(title: str) -> bytes:
+        want = int(avg * rng.uniform(0.2, 1.8))
+        parts, size = [f"# {title}\n"], 0
+        while size < want:
+            line = rng.choice(pool)
+            parts.append(line)
+            size += len(line)
+        return "".join(parts).encode()
+
+    out: List[Tuple[str, bytes, bool]] = []
+    projects = 15
+    for i in range(memory_files):
+        proj, n = i % projects, i // projects
+        name = "MEMORY.md" if n == 0 else f"note{n}.md"
+        out.append((f"memory/-Users-__USER__-fx{proj}/{name}", body(f"memory {proj} {n}"), False))
+    folders = 60
+    for i in range(skill_files):
+        folder, n = i % folders, i // folders
+        name = "SKILL.md" if n == 0 else f"references/ref{n}.md"
+        out.append((f"skills/skill{folder}/{name}", body(f"skill {folder} {n}"), False))
+    for i in range(hooks):
+        out.append((f"hooks/hook{i}.sh", b"#!/bin/sh\n" + body(f"hook {i}"), True))
+    return sorted(out)
+
+
 class Machine:
     """One simulated computer: its own HOME, its own clone of the sync repo."""
 
@@ -108,6 +146,15 @@ class Machine:
         assert_not_real(self.claude)
         return subprocess.Popen([sys.executable, "-c", EDITOR, str(self.claude), str(rounds), *rels],
                                 env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def edit_n(self, n: int) -> None:
+        """Append a line to n memory files under ~/.claude (the last n by name, so not the first n that remote_commit_n edits)."""
+        files = sorted((self.claude / "projects").glob("*/memory/*.md"))
+        assert len(files) >= n, f"only {len(files)} memory files, wanted {n}"
+        for p in files[-n:]:
+            assert_not_real(p)
+            with open(p, "ab") as fh:
+                fh.write(b"local edit\n")
 
     def write(self, rel: str, data: Union[str, bytes], exec_bit: bool = False) -> Path:
         p = self.claude / rel
@@ -264,31 +311,90 @@ class SyncTestCase(unittest.TestCase):
         return sorted(r.decode()[len("data/"):] for r in out.split(b"\0") if r)
 
     def make_gitcrypt_remote(self) -> Path:
-        path = self._env()["PATH"]
-        if shutil.which("git-crypt", path=path) is None:
+        key = self._build_remote(True, "_gcseed", lambda scratch: None, keep=False)
+        assert key is not None
+        return key
+
+    def _build_remote(self, gitcrypt: bool, scratch_name: str, populate: Callable[[Path], None],
+                      keep: bool) -> Optional[Path]:
+        """Rebuild remote.git as one seed commit. populate(scratch) adds files before the commit.
+
+        With gitcrypt, the throwaway key is made inside the test directory (git-crypt init in the scratch
+        clone) and its exported path returned. keep leaves the unlocked scratch clone in place.
+        """
+        env = self._env()
+        if gitcrypt and shutil.which("git-crypt", path=env["PATH"]) is None:
             self.skipTest("git-crypt is not installed")
         shutil.rmtree(self.remote)
         self._init_remote()
-        scratch = self.root / "_gcseed"
+        scratch = self.root / scratch_name
         self._clone(scratch)
         self._git(scratch, "config", "user.name", "Test")
-        env = self._env()
         key = self.root / "test.key"
-        cp = subprocess.run(["git-crypt", "init"], cwd=str(scratch), env=env, capture_output=True)
-        if cp.returncode != 0:
-            raise AssertionError(f"git-crypt init failed: {cp.stderr.decode()}")
-        (scratch / ".gitattributes").write_text("data/** filter=git-crypt diff=git-crypt\n")
+        if gitcrypt:
+            cp = subprocess.run(["git-crypt", "init"], cwd=str(scratch), env=env, capture_output=True)
+            if cp.returncode != 0:
+                raise AssertionError(f"git-crypt init failed: {cp.stderr.decode()}")
+            (scratch / ".gitattributes").write_text("data/** filter=git-crypt diff=git-crypt\n")
         (scratch / "bin").mkdir()
         (scratch / "data").mkdir()
         shutil.copyfile(WORKTREE / ".gitignore", scratch / ".gitignore")
         (scratch / "bin" / "README").write_text("seed\n")
         (scratch / "data" / "CLAUDE.md").write_text("# shared\n")
+        populate(scratch)
         self._git(scratch, "add", "-A")
         self._git(scratch, "commit", "-q", "-m", "seed")
         self._git(scratch, "push", "-q", "origin", "HEAD:main")
-        cp = subprocess.run(["git-crypt", "export-key", str(key)], cwd=str(scratch), env=env, capture_output=True)
-        if cp.returncode != 0:
-            raise AssertionError(f"git-crypt export-key failed: {cp.stderr.decode()}")
-        shutil.rmtree(scratch)
+        if gitcrypt:
+            cp = subprocess.run(["git-crypt", "export-key", str(key)], cwd=str(scratch), env=env, capture_output=True)
+            if cp.returncode != 0:
+                raise AssertionError(f"git-crypt export-key failed: {cp.stderr.decode()}")
+        if not keep:
+            shutil.rmtree(scratch)
         shutil.rmtree(self.root / "_other", ignore_errors=True)
-        return key
+        return key if gitcrypt else None
+
+    def make_fixture(self, memory_files: int = 750, skill_files: int = 600, total_bytes: int = 17 * 2**20,
+                     gitcrypt: bool = True) -> Optional[Path]:
+        """Rebuild remote.git with deterministic content shaped like the live data, in one commit.
+
+        Returns the key path when gitcrypt. An unlocked clone stays at <root>/_fixture for remote_commit_n.
+        """
+        files = fixture_files(memory_files, skill_files, total_bytes)
+        self.fixture_memory = [rel for rel, _data, _exec in files if rel.startswith("memory/")]
+
+        def populate(scratch: Path) -> None:
+            for rel, data, exec_bit in files:
+                p = scratch / "data" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+                p.chmod(0o755 if exec_bit else 0o644)
+
+        return self._build_remote(gitcrypt, "_fixture", populate, keep=True)
+
+    def remote_commit_n(self, n: int) -> str:
+        """One commit on the remote that appends a line to the first n fixture memory files."""
+        scratch = self.root / "_fixture"
+        self._git(scratch, "fetch", "-q", "origin")
+        self._git(scratch, "reset", "-q", "--hard", "origin/main")
+        for rel in self.fixture_memory[:n]:
+            with open(scratch / "data" / rel, "ab") as fh:
+                fh.write(b"remote edit\n")
+        self._git(scratch, "add", "-A")
+        self._git(scratch, "commit", "-q", "-m", f"remote edits to {n} files")
+        self._git(scratch, "push", "-q", "origin", "HEAD:main")
+        return self._git(scratch, "rev-parse", "HEAD")
+
+    def remote_data_blobs(self) -> List[bytes]:
+        """Raw bytes of every blob under data/ at the remote tip, read without filters."""
+        out = self._git(self.remote, "ls-tree", "-r", "-z", "main", "--", "data/", binary=True)
+        oids = [rec.partition(b"\t")[0].split(b" ")[2].decode() for rec in out.split(b"\0") if rec]
+        cp = subprocess.run(["git", "-C", str(self.remote), "cat-file", "--batch"], env=self._env(),
+                            input="".join(o + "\n" for o in oids).encode(), capture_output=True, check=True)
+        raw, pos, blobs = cp.stdout, 0, []
+        for _ in oids:
+            eol = raw.index(b"\n", pos)
+            size = int(raw[pos:eol].split(b" ")[2])
+            blobs.append(raw[eol + 1:eol + 1 + size])
+            pos = eol + 1 + size + 1
+        return blobs
