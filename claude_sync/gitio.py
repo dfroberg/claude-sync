@@ -25,7 +25,8 @@ OFFLINE_PATTERNS = (
     "could not resolve host", "network is unreachable", "connection timed out",
     "connection refused", "operation timed out", "ssh: connect to host",
 )
-REJECT_PATTERNS = ("[rejected]", "non-fast-forward", "fetch first", "stale info")
+REJECT_PATTERNS = ("[rejected]", "non-fast-forward", "fetch first", "stale info",
+                   "incorrect old value", "cannot lock ref")
 
 
 def strip_git_env(env: Dict[str, str]) -> None:

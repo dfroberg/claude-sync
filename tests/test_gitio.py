@@ -159,6 +159,23 @@ class GitioTest(SyncTestCase):
         self.local_commit("mine2.md", "2\n")
         self.assertEqual(g.push("main"), "rejected")
 
+    def test_push_remote_ref_race_is_rejected(self):
+        # Two machines push at once: the remote's ref update loses the race and git reports
+        # "[remote rejected] ... (incorrect old value provided)", not "[rejected] (fetch first)".
+        g = self.g
+        hooks = self.root / "remote-hooks"
+        hooks.mkdir()
+        hook = hooks / "pre-receive"
+        hook.write_text("#!/bin/sh\n"
+                        "unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\n"
+                        "new=$(git commit-tree 'main^{tree}' -p main -m racer) || exit 1\n"
+                        "git update-ref refs/heads/main \"$new\"\n")
+        hook.chmod(0o755)
+        self._git(self.remote, "config", "core.hooksPath", str(hooks))
+        self.local_commit("mine.md", "1\n")
+        self.assertEqual(g.push("main"), "rejected", (self.root / "test.log").read_text())
+        self.assertNotEqual(self.remote_tip(), g.rev("HEAD"))
+
     def test_push_error_and_offline(self):
         g, m = self.g, self.m
         m.git("remote", "set-url", "origin", "file:///nonexistent")
