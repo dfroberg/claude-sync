@@ -106,6 +106,28 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(o.act, Act.WRITE)
         self.assertTrue(o.content.exec)
 
+    SAME, OLD = b"same\n", b"old\n"
+
+    def test_identical_content_local_lacks_bit_takes_remote_bit(self):
+        o = decide("skills/x/tool.py", C(self.SAME, False), C(self.OLD, False), C(self.SAME, True), False)
+        self.assertEqual(o, Outcome(Act.WRITE, content=C(self.SAME, True)))
+
+    def test_identical_content_local_bit_change_kept(self):
+        o = decide("skills/x/tool.py", C(self.SAME, True), C(self.OLD, False), C(self.SAME, False), False)
+        self.assertEqual(o, Outcome(Act.NOTHING))
+
+    def test_identical_content_no_base_keeps_local_bit(self):
+        o = decide("skills/x/tool.py", C(self.SAME, False), None, C(self.SAME, True), False)
+        self.assertEqual(o, Outcome(Act.NOTHING))
+
+    def test_identical_content_no_base_fresh_takes_remote_bit(self):
+        o = decide("skills/x/tool.py", C(self.SAME, False), None, C(self.SAME, True), True)
+        self.assertEqual(o, Outcome(Act.WRITE, content=C(self.SAME, True)))
+
+    def test_identical_content_text_path_is_not_a_merge(self):
+        o = decide("skills/x/x.md", C(self.SAME, False), C(self.OLD, False), C(self.SAME, True), False)
+        self.assertEqual(o, Outcome(Act.WRITE, content=C(self.SAME, True)))
+
     def test_outcome_is_frozen(self):
         with self.assertRaises(Exception):
             Outcome(Act.NOTHING).act = Act.WRITE

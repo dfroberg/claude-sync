@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from claude_sync.merge import merge_content
+from claude_sync.merge import merge_content, merge_exec
 from claude_sync.paths import Content
 
 
@@ -40,6 +40,9 @@ def decide(rel: str, L: Optional[Content], B: Optional[Content], R: Optional[Con
         return Outcome(Act.WRITE, content=R)
     if R is None:
         return Outcome(Act.KEEP_LOCAL, warn="local edit beats remote delete", local_win=True)
+    if L.data == R.data:
+        bit = merge_exec(L.exec, B.exec if B is not None else None, R.exec, fresh)
+        return Outcome(Act.NOTHING) if bit == L.exec else Outcome(Act.WRITE, content=Content(L.data, bit))
     merged = merge_content(rel, L, B, R, fresh)
     if merged is not None:
         return Outcome(Act.WRITE, content=merged, merged=True)
