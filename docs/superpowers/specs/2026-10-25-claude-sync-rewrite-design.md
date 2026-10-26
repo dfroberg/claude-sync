@@ -116,8 +116,10 @@ found it appends a timestamped ERROR to `last-sync.log` in the repo root, prints
 one-line notice from 6.11 to stdout, and exits 0, so a hook never breaks a session but the
 session still sees the problem.
 
-`.gitignore` gains: `.sync.lock`, `.fresh-machine`, `conflicts/`, `trash/`, `__pycache__/`,
-`*.sync-tmp.*`.
+`.gitignore` gains, anchored at the repo root so the same names under `data/` still sync:
+`/.sync.lock`, `/.fresh-machine`, `/conflicts/`, `/trash/`, `/claude_sync/__pycache__/`,
+`/tests/__pycache__/`, `/last-sync.log.1`, `/.hold-*`; and `*.sync-tmp.*` at any depth
+(round 3 re-check, item 4: `data/` holds `__pycache__` folders under `skills/` today).
 
 ### 6.2 Paths and environment
 
@@ -273,7 +275,10 @@ No base ref (the first run of the new code on a machine, for migration or a new 
    still there afterwards means another git process is running: a git child runs in its
    own session, so it can outlive a run killed by a hook timeout and still be rewriting
    `data/`. The run then logs INFO `git busy` and exits 0 without reading or writing
-   anything (round 3, finding 2).
+   anything (round 3, finding 2). A `.git/index.lock` of 60 s or older that is still
+   there (the removal failed, for example a root-owned file) stops the run with an ERROR
+   asking for it to be removed by hand, so it never turns into a silent skip on every
+   run.
 2. Remove `.git/rebase-merge` and `.git/rebase-apply` left by the old code, with a WARN
    line. If the directory holds an `autostash` file, first run
    `git stash store -m "autostash of a killed sync run" <its sha>` (as bin/claude-sync
@@ -512,7 +517,9 @@ no autostash, no merge commits.
 - An uncaught exception is logged with its traceback and exits 1.
 - SIGTERM or SIGHUP (a hook timeout, a closed session) ends the run through the normal
   exit path: the running git child and its process group are killed, a WARN
-  `terminated by signal` is logged, and the exit code is 128 plus the signal number.
+  `terminated by signal` is logged, a run that holds the lock removes the git lock files
+  at once (as after a timeout kill, 6.6 step 1), and the exit code is 128 plus the
+  signal number.
 - stdout notice: plain text, one line, at most 200 characters, only when there is
   something to act on (kept-both conflicts, local-edit-beats-delete, ERROR, or the shim
   finding no usable python). Example:
@@ -532,7 +539,9 @@ no autostash, no merge commits.
   cases `data/` is not the decrypted base and a count would be wrong.
 - `dry-run` (alias `dry`): takes the lock (20 s wait), runs the checks of 6.6 including
   the unlock and the invariant restore, then the push scan only; prints what would be
-  added, changed and deleted. No commit, no fetch, no push.
+  added, changed and deleted. No commit, no fetch, no push. When it checks nothing
+  (the run lock is busy, or git is busy as in 6.6 step 1) it prints one
+  `claude-sync: ...` line saying so, so an empty answer always means no local changes.
 
 memory-reconcile is no longer called from pull or push. The union merge in 6.9 covers the
 case it was built for (two machines overwriting each other's index). It stays in `bin/`
@@ -759,9 +768,10 @@ Code first, nix second, never the other way round (section 7).
    to the remote. If it holds local work that must survive, copy that work aside before
    that session start.
 3. Push the branch `dfroberg/TO-772-ignore-first` to `main` first. It is one commit on
-   top of `main` that changes only `.gitignore` (adds `conflicts/`, `trash/`,
-   `.sync.lock`, `.fresh-machine`, `last-sync.log.1`, `.hold-*` and the temporary file
-   patterns) and `.gitattributes` (encrypts `conflicts/**` and `trash/**`). Then merge
+   top of `main` that changes only `.gitignore` (adds the repo-root entries of 6.1:
+   `/conflicts/`, `/trash/`, `/.sync.lock`, `/.fresh-machine`, `/last-sync.log.1`,
+   `/.hold-*`, the two `__pycache__` folders of the code, and `*.sync-tmp.*`) and
+   `.gitattributes` (encrypts `conflicts/**` and `trash/**`). Then merge
    the rewrite branch into `main` of `dfroberg/claude-sync` and push. The merge touches
    only `bin/`, `claude_sync/`, `tests/`, `docs/`, `README.md` (new-machine steps gain the
    `touch .fresh-machine` line), `.gitignore` and `.gitattributes`; `data/` is not
@@ -771,12 +781,13 @@ Code first, nix second, never the other way round (section 7).
    do not let a session start bring in the new code, because that runs the old pull's
    `apply()` once more and writes the remote's copies over edits made since step 2. Run
    `git -C ~/.claude-sync fetch -q origin && git -C ~/.claude-sync reset --hard -q origin/main`
-   and then `claude-sync pull` (now the new code). Files that changed since step 2 differ
+   and then `~/.claude-sync/bin/claude-sync pull` (now the new code). Files that changed since step 2 differ
    on both sides with no base: the local copy stays and the remote copy is parked
    (6.4), so nothing is lost. Second Mac (Dannys-MacBook-Pro): once a pull has brought
-   in the new code (any session start, as step 2 describes), run `claude-sync pull` by
-   hand so the first new-code run happens at once and sets the base. On both Macs check
-   `claude-sync status`, the log and any notice.
+   in the new code (any session start, as step 2 describes), run
+   `~/.claude-sync/bin/claude-sync pull` by hand so the first new-code run happens at once
+   and sets the base. On both Macs check `~/.claude-sync/bin/claude-sync status`, the log
+   and any notice.
 5. Only on a Mac where step 4 is done: merge the dotnix branch and switch there.
 6. Watch for a week: `find ~/.claude/projects/*/memory -type f -size 0` stays empty, no
    unexpected `conflicts/` folders, no ERROR lines.
@@ -784,9 +795,9 @@ Code first, nix second, never the other way round (section 7).
 Rollback: if the nix change was switched, switch back to the previous home-manager
 generation first (the old code with the new hooks is the bad pairing in section 7). Then
 revert the merge commit only (never the ignore-first commit of step 3) on `main` and
-push; each Mac returns to the old code on its next pull. Before the first old-code push
-on each Mac, move `~/.claude-sync/conflicts` and `~/.claude-sync/trash` out of the repo
-(for example to `~/claude-sync-parked/`): they hold plaintext copies, and the ignore and
+push; each Mac returns to the old code on its next pull. Before reverting, move
+`~/.claude-sync/conflicts` and `~/.claude-sync/trash` out of the repo on each Mac (for
+example to `~/claude-sync-parked/`): they hold plaintext copies, and the ignore and
 encrypt entries are the only thing between them and the old push's `git add -A`. If
 the new code cannot pull at all:
 `git -C ~/.claude-sync fetch origin && git -C ~/.claude-sync reset --hard origin/main`.
@@ -855,10 +866,15 @@ Changes made after the owner's approval, from the final Fable gate on the built 
   of a last old pull, so the old `apply()` never runs there again.
 - A young `.git/index.lock` makes a run skip (INFO `git busy`, exit 0) instead of
   proceeding (6.6 step 1). SIGTERM and SIGHUP kill the running git child (6.11).
+- From the re-check of those fixes: an index lock that cannot be removed stops the run
+  with an ERROR; a terminated run clears the git lock files; a dry-run that checks
+  nothing says so; the repo-root ignore entries are anchored so the same names under
+  `data/` still sync.
 
 ## 12. Adversarial review
 
-Two rounds ran. The first ran on Fable, because the lead wrongly concluded that xAI was
+Two rounds ran on the design and a third, the final gate, on the built branch. The first
+ran on Fable, because the lead wrongly concluded that xAI was
 unreachable: it checked only for `XAI_API_KEY` in the environment and missed
 `~/.config/xai/env`, which defines it. The owner pointed this out, and the required
 grok-4.7 round then ran against the approved design (see "Round 2" below). The Fable
@@ -987,3 +1003,16 @@ verified in the code and fixed:
 | 4 | Minor | Equal content with only the exec bit different became a keep-both for a non-text file, against 6.8's own rule for the bit. | Accepted. Equal content takes the bit from the three-way exec rule, for every file type. Five tests in `test_decide.py`. |
 | 5 | Minor | The hooks ensure script skipped symlinked Orca profile settings but not a symlinked `~/.claude/settings.json`. | Accepted. Both are skipped (dotnix commit cece391). Not the case on this Mac today. |
 | 6 | Minor | On the main Mac, the session start that brings in the new code still ran the old pull's `apply()`, writing the remote's copies over edits made since step 2. | Accepted. Section 9 step 4: fetch and reset, then the new pull, on the main Mac. |
+
+### Round 3: re-check of the fixes
+
+One Fable pass over the six fixes only. Verdict: ready for the owner's rollout review,
+all six closed. It raised four new items and three wording points, all fixed:
+
+| # | Sev | Item | Resolution |
+|---|-----|------|------------|
+| 1 | Minor | The lock removal swallows its error, so a stale `.git/index.lock` that cannot be removed (root-owned) made every run skip silently, where before it was a loud ERROR. | An index lock of 60 s or older that survives the removal stops the run with an ERROR (6.6 step 1). |
+| 2 | Minor | A dry-run that skipped (git busy) printed nothing, which reads as "no local changes". | A dry-run that checks nothing, because git or the run lock is busy, prints one line saying so (6.12). |
+| 3 | Low | A run ended by SIGTERM left the killed child's lock files, so the next run skipped for up to 60 s. | A terminated run that holds the lock removes them at once, as a timeout kill does (6.11). |
+| 4 | Low | The unanchored `conflicts/`, `trash/` and `__pycache__/` ignore entries also matched those names under `data/`, so such files silently never synced; `data/skills/` holds `__pycache__` folders today. | The repo-root entries are anchored with a leading slash (6.1); the ignore-first commit is rebuilt with the same file. |
+| - | Wording | Section 9: name the full path of the new tool in step 4; move the parked folders before reverting, not before the first old-code push; step 3's list missed `__pycache__/`. | Fixed in section 9. |
