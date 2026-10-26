@@ -13,7 +13,9 @@ from typing import Dict, List, Optional, Set, Tuple
 from claude_sync.checks import StopRun, _uses_gitcrypt, prepare, restore_invariant
 from claude_sync.context import BASE_REF, PENDING_REF, Ctx
 from claude_sync.fsops import CiphertextError, atomic_write, is_ciphertext, move_aside, read_content
-from claude_sync.paths import Content, canon_content, decanon_content, scan_local, to_local, under, via_symlink
+from claude_sync.paths import (
+    Content, UnderCache, canon_content, decanon_content, scan_local, to_local, under, via_symlink,
+)
 from claude_sync.pull import fetch_origin, pull_steps
 
 MAX_ATTEMPTS = 3
@@ -60,6 +62,7 @@ def scan(ctx: Ctx) -> Scan:
     except OSError as e:
         raise StopRun(f"cannot scan {_shown(ctx, e.filename or cfg.claude)}: {e.strerror or e}")
     out = Scan(skipped=set(skipped))
+    data_path = UnderCache(cfg.data)
     for rel in sorted(local):
         path = local[rel]
         raw = _read(ctx, path)
@@ -67,7 +70,7 @@ def scan(ctx: Ctx) -> Scan:
             continue
         out.local[rel] = path
         new = canon_content(rel, raw, cfg.me)
-        old = _read(ctx, under(cfg.data, rel))
+        old = _read(ctx, data_path(rel))
         if old is not None and is_ciphertext(old.data):
             raise StopRun("data/ holds ciphertext; repo is not unlocked")
         if old is None or old.data != new.data or old.exec != new.exec:

@@ -61,6 +61,29 @@ def under(root: Path, rel: str) -> Path:
     return target
 
 
+class UnderCache:
+    """under() for many paths below one root: the root and each parent folder are resolved once."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self._real_root = os.path.realpath(root)
+        self._prefix = self._real_root.rstrip(os.sep) + os.sep
+        self._parents: Dict[str, bool] = {}
+
+    def __call__(self, rel: str) -> Path:
+        if not safe_rel(rel):
+            raise ValueError(f"unsafe path {rel}")
+        parent = rel.rpartition("/")[0]
+        ok = self._parents.get(parent)
+        if ok is None:
+            real_parent = os.path.realpath(self.root / parent) if parent else self._real_root
+            ok = real_parent == self._real_root or real_parent.startswith(self._prefix)
+            self._parents[parent] = ok
+        if not ok:
+            raise ValueError(f"unsafe path {rel}")
+        return self.root / rel
+
+
 def _canon_name(name: str, me: str) -> str:
     return os.fsdecode(canon(os.fsencode(name), me))
 

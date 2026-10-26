@@ -8,7 +8,7 @@ from pathlib import Path
 
 from claude_sync.paths import (
     DIRS, FILES, TEXT_EXT, TOKEN, Content, canon, canon_content, decanon, decanon_content,
-    is_text, is_tmp, safe_rel, scan_local, to_local, to_repo, under, via_symlink,
+    UnderCache, is_text, is_tmp, safe_rel, scan_local, to_local, to_repo, under, via_symlink,
 )
 
 
@@ -86,6 +86,29 @@ class PathsTest(unittest.TestCase):
         os.symlink(outside, root / "link")
         with self.assertRaises(ValueError):
             under(root, "link/x.md")
+
+    def test_under_cache_matches_under(self):
+        root = Path(tempfile.mkdtemp(prefix="cs-under-")).resolve()
+        outside = Path(tempfile.mkdtemp(prefix="cs-out-")).resolve()
+        self.addCleanup(shutil.rmtree, str(root), True)
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (root / "skills" / "s").mkdir(parents=True)
+        os.symlink(outside, root / "link")
+        os.symlink(outside, root / "skills" / "s" / "inner")
+        cache = UnderCache(root)
+        for rel in ["CLAUDE.md", "skills/s/a.md", "skills/s/b.md", "skills/t/c.md", "skills/s/new/deep/x.md"]:
+            self.assertEqual(cache(rel), under(root, rel), rel)
+        for rel in ["link/x.md", "skills/s/inner/x.md", "skills/s/inner/y.md"]:       # first call and a repeat
+            for _ in range(2):
+                with self.assertRaises(ValueError, msg=rel):
+                    cache(rel)
+        for rel in ["", "/abs", "a/../b", "a//b"]:
+            with self.assertRaises(ValueError, msg=rel):
+                cache(rel)
+        # a call after a safe sibling was cached still refuses the escaping folder
+        cache("skills/s/z.md")
+        with self.assertRaises(ValueError):
+            cache("skills/s/inner/z.md")
 
     def test_content_helpers_leave_binary_alone(self):
         raw = Content(b"/Users/alice/x", True)
