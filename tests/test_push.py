@@ -5,7 +5,13 @@ import shutil
 import subprocess
 import time
 import unittest
+from unittest import mock
 
+from claude_sync import config, push
+from claude_sync.checks import StopRun
+from claude_sync.context import Ctx, Report
+from claude_sync.gitio import Git
+from claude_sync.log import Log
 from tests.harness import SyncTestCase, wait_for
 
 LOCAL = "projects/-Users-alice-p/memory/"      # under ~/.claude
@@ -157,6 +163,24 @@ class PushTest(SyncTestCase):
         self.assertEqual(self.remote_tip(), tip)
         self.assertEqual(self.remote_text(REPO + "x.md"), "content\n")
         self.assertTrue(any(" WARN " in ln and "x.md" in ln for ln in a.log_lines()))
+
+    def test_empty_file_guard_crash_keeps_path(self):
+        a, = self.synced("a")
+        rel = LOCAL + "x.md"
+        self.remote_commit({REPO + "x.md": "content\n"})
+        a.run("pull")
+        a.write(rel, "")
+        t = time.time() - 11 * 60
+        os.utime(a.claude / rel, (t, t))
+        cfg = config.load(a.env())
+        log = Log(a.repo / "last-sync.log", "push", True)
+        ctx = Ctx(cfg, log, Git(a.repo, log, base_env=a.env()), Report(), "2026-10-25T16-31-02Z")
+        s = push.scan(ctx)
+        self.assertIn(REPO + "x.md", s.changed)
+        with mock.patch("claude_sync.push.atomic_write", side_effect=OSError(5, "Input/output error")):
+            with self.assertRaises(StopRun):
+                push._empty_file_guard(ctx, s)
+        self.assertTrue((a.claude / rel).exists())               # a crash between the two steps never leaves the path absent
 
     def test_exec_bit_pushed(self):                          # spec test 25, push half
         a, b = self.synced("a", "b")

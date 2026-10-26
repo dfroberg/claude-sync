@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from claude_sync.checks import StopRun, _uses_gitcrypt, prepare, restore_invariant
 from claude_sync.context import BASE_REF, PENDING_REF, Ctx
-from claude_sync.fsops import CiphertextError, atomic_write, is_ciphertext, move_aside, read_content
+from claude_sync.fsops import CiphertextError, atomic_write, copy_aside, is_ciphertext, read_content
 from claude_sync.paths import (
     Content, UnderCache, canon_content, decanon_content, scan_local, to_local, under, via_symlink,
 )
@@ -115,7 +115,7 @@ def _empty_file_guard(ctx: Ctx, s: Scan) -> None:
             local_rel = to_local(rel, cfg.me)
             assert local_rel is not None
             try:
-                move_aside(local, ctx.trash_root, local_rel)
+                copy_aside(local, ctx.trash_root, local_rel)
                 atomic_write(local, decanon_content(rel, old, cfg.me))
             except (OSError, ValueError, CiphertextError) as e:
                 raise StopRun(f"cannot restore {local_rel}: {getattr(e, 'strerror', None) or e}")
