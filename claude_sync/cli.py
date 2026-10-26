@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import List, Mapping, Optional
 
 from claude_sync import config, pull, push
-from claude_sync.checks import StopRun, _uses_gitcrypt, is_locked, prepare
+from claude_sync.checks import SkipRun, StopRun, _uses_gitcrypt, is_locked, prepare
 from claude_sync.context import BASE_REF, PENDING_REF, Ctx, Report
 from claude_sync.fsops import CiphertextError, is_ciphertext, prune_older_than
 from claude_sync.gitio import Git, GitError
@@ -128,6 +128,10 @@ def main(argv: List[str], env: Optional[Mapping[str, str]] = None) -> int:
                 return 0
             ctx.lock_fd = fd
         rc = HANDLERS[command](ctx)
+    except SkipRun as e:
+        log.info(str(e))
+        report.noop = True
+        rc = 0
     except EXPECTED_ERRORS as e:
         log.error(str(e))
         report.fail(str(e))

@@ -261,6 +261,22 @@ class PullEdgeTest(SyncTestCase):
         self.assertEqual(a.base(), base_before)
         self.assertIn(f"claude-sync: ERROR merge failed for {rel}", r.stdout)
 
+    def test_young_index_lock_skips_pull(self):
+        a, = self.synced("a")
+        base_before = a.base()
+        self.remote_commit({REPO + "theirs.md": "theirs\n"})
+        lock = a.repo / ".git" / "index.lock"
+        lock.write_text("")                                    # mtime now: another git process is busy
+        r = a.run("pull")
+        self.assertEqual(r.stdout, "")
+        self.assertTrue(any(" INFO git busy" in ln for ln in a.log_lines()), a.log_lines())
+        self.assertIsNone(a.read(LOCAL + "theirs.md"))
+        self.assertEqual(a.base(), base_before)
+        self.assertTrue(lock.exists())
+        lock.unlink()
+        a.run("pull")
+        self.assertEqual(a.read(LOCAL + "theirs.md"), "theirs\n")
+
 
 if __name__ == "__main__":
     unittest.main()

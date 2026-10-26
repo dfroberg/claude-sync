@@ -15,10 +15,16 @@ class StopRun(Exception):
     pass
 
 
+class SkipRun(Exception):
+    pass
+
+
 def prepare(ctx: Ctx) -> None:
     git, log, cfg = ctx.git, ctx.log, ctx.cfg
     for path in git.clear_locks(60):
         log.warn(f"removed stale git lock {path}")
+    if (cfg.repo / ".git" / "index.lock").exists():
+        raise SkipRun("git busy: .git/index.lock is held by another git process; skipping")
     _clear_dead_rebase(ctx)
     _attach_head(ctx)
     dirty = git.dirty_outside_data()

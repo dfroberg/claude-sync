@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from claude_sync import config
-from claude_sync.checks import StopRun, ensure_unlocked, prepare, restore_invariant
+from claude_sync.checks import SkipRun, StopRun, ensure_unlocked, prepare, restore_invariant
 from claude_sync.context import BASE_REF, Ctx, Report
 from claude_sync.gitio import Git
 from claude_sync.log import Log
@@ -40,7 +40,8 @@ class ChecksTest(SyncTestCase):
         lock = m.repo / ".git" / "index.lock"
         lock.write_text("")
         self.age(lock, 5)
-        prepare(self.ctx(m))
+        with self.assertRaises(SkipRun):
+            prepare(self.ctx(m))
         self.assertTrue(lock.exists())
 
     def _dead_rebase(self, m, sha_text):
