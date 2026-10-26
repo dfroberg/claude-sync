@@ -23,6 +23,19 @@ FORBIDDEN = [REAL_HOME / ".claude", REAL_HOME / ".claude-sync", REAL_HOME / ".co
 WORKTREE = Path(__file__).resolve().parent.parent
 TOOL = WORKTREE / "bin" / "claude-sync"
 
+# A stand-in for a Claude session that keeps editing files: appends "round N" to each file every 50 ms.
+EDITOR = (
+    "import os, sys, time\n"
+    "root, rounds, rels = sys.argv[1], int(sys.argv[2]), sys.argv[3:]\n"
+    "for n in range(rounds):\n"
+    "    for rel in rels:\n"
+    "        path = os.path.join(root, rel)\n"
+    "        os.makedirs(os.path.dirname(path), exist_ok=True)\n"
+    "        with open(path, 'a') as fh:\n"
+    "            fh.write('round %d\\n' % n)\n"
+    "    time.sleep(0.05)\n"
+)
+
 Change = Optional[Union[str, bytes, Tuple[bytes, bool]]]
 
 
@@ -89,6 +102,12 @@ class Machine:
     def popen(self, *args: str, env: Optional[dict] = None, cwd: Optional[Path] = None) -> subprocess.Popen:
         return subprocess.Popen([str(TOOL), *args], env=env or self.env(), cwd=str(cwd or self.root),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def popen_editor(self, rels: List[str], rounds: int) -> subprocess.Popen:
+        """Start a child that appends "round N" (N = 0 .. rounds - 1) to every rel under ~/.claude, 50 ms apart."""
+        assert_not_real(self.claude)
+        return subprocess.Popen([sys.executable, "-c", EDITOR, str(self.claude), str(rounds), *rels],
+                                env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def write(self, rel: str, data: Union[str, bytes], exec_bit: bool = False) -> Path:
         p = self.claude / rel
