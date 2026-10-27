@@ -8,3 +8,15 @@
 
 # Local push log; noisy, machine-specific, and plaintext in a public repo.
 last-sync.log
+
+# The rewrite's local state, all at the repo root. Anchored so the same names under
+# data/ still sync; only the temporary files of atomic writes are ignored at any depth.
+/.sync.lock
+/.fresh-machine
+/conflicts/
+/trash/
+/claude_sync/__pycache__/
+/tests/__pycache__/
+*.sync-tmp.*
+/last-sync.log.1
+/.hold-*
