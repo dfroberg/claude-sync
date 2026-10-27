@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# claude-sync — sync ~/.claude memories/settings/skills across machines via a
-# git-crypt-encrypted git repo, with user/path canonicalization.
+# claude-sync: sync ~/.claude memories/settings/skills across machines via a
+# git-crypt-encrypted git repo. This file only picks a Python 3.9+ interpreter and runs
+# the claude_sync package from the repo it lives in.
 #
-# The repo stores a curated ALLOWLIST (never transcripts/caches/plugins/auth).
-# Paths are canonicalized to a __USER__ sentinel on push and rehydrated to the
-# local user on pull, so dfroberg and dannyfroberg are the same person.
+#   claude-sync pull      take remote changes into ~/.claude (three-way, never loses a local edit)
+#   claude-sync push      collect ~/.claude into the repo, commit, push
+#   claude-sync status    show the sync state
+#   claude-sync dry-run   show what a push would send
 #
-#   claude-sync push      collect ~/.claude -> repo, commit, push
-#   claude-sync pull      pull repo -> apply into ~/.claude
-#   claude-sync dry-run   collect only (no git); print what would sync
-#   claude-sync status    git status of the sync repo
-set -euo pipefail
+# No `set -e`: every path ends in an explicit exit, and a hook must never break a session.
 
-REPO="${CLAUDE_SYNC_REPO:-$HOME/.claude-sync}"
 # launchd hands the push agent a bare PATH (/usr/bin:/bin:...). Apple git then runs the
 # global git-lfs pre-push hook (core.hookspath) and cannot find git-lfs, which lives in the
 # nix per-user profile, so every timer push failed with "failed to push some refs" -- 7
@@ -22,339 +19,33 @@ for _p in /opt/homebrew/bin /run/current-system/sw/bin "$HOME/.nix-profile/bin" 
   [ -d "$_p" ] && case ":$PATH:" in *":$_p:"*) ;; *) PATH="$_p:$PATH";; esac
 done
 export PATH
-CLAUDE="$HOME/.claude"
-DATA="$REPO/data"
-TOKEN="__USER__"
-ME="$(id -un)"
-BRANCH="${CLAUDE_SYNC_BRANCH:-main}"
-LOCKDIR="$REPO/.sync.lock.d"
 
-log(){ printf '[claude-sync] %s\n' "$*" >&2; }
-die(){ log "ERROR: $*"; exit 1; }
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
-# Recursion guard. memory-reconcile shells out to `claude`, and this script runs FROM
-# SessionStart/SessionEnd hooks -- so a nested session that ran hooks would re-enter here
-# forever. memory-reconcile passes --settings '{"disableAllHooks":true}', which should make
-# that impossible; this is the independent second line of defence in case it ever does not.
-[ "${CLAUDE_SYNC_RECONCILING:-0}" = "1" ] && { log "nested invocation; skipping"; exit 0; }
+# CLAUDE_SYNC_PYTHON, when set, is the only candidate (tests set it; a missing path tests the
+# no-python branch below).
+if [ -n "${CLAUDE_SYNC_PYTHON:-}" ]; then
+  candidates=("$CLAUDE_SYNC_PYTHON")
+else
+  candidates=("/etc/profiles/per-user/$(id -un)/bin/python3"
+              "$HOME/.nix-profile/bin/python3"
+              "/run/current-system/sw/bin/python3"
+              "/opt/homebrew/bin/python3")
+  # /usr/bin/python3 is a stub that opens an install dialog without the command line tools.
+  xcode-select -p >/dev/null 2>&1 && candidates+=("/usr/bin/python3")
+fi
 
-RECONCILE="$REPO/bin/memory-reconcile"
+for py in "${candidates[@]}"; do
+  [ -x "$py" ] || continue
+  "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 || continue
+  # cd + -E -s -B: `-m` puts the current directory first on sys.path, so a json.py in a
+  # hook's project directory would shadow the standard library.
+  cd "$ROOT" && exec "$py" -E -s -B -m claude_sync "$@"
+done
 
-# Bring every project's MEMORY.md back in line with its files. $1, if given, is a directory
-# of pre-apply MEMORY.md snapshots keyed by project, used to recover entries the apply
-# overwrote. Never fatal: a broken index is worth fixing, never worth failing a sync over.
-reconcile_indexes(){
-  [ -x "$RECONCILE" ] || return 0
-  [ "${CLAUDE_SYNC_NO_RECONCILE:-0}" = "1" ] && return 0
-  snaps="${1:-}"
-  # Whole-pass budget. Each project is individually bounded, but 15 projects still add up,
-  # and sync is called from a SessionEnd hook with a 45s timeout of its own -- a slow
-  # reconcile must never be what stops memories being pushed.
-  deadline=$(( $(date +%s) + ${CLAUDE_SYNC_RECONCILE_BUDGET:-240} ))
-  for m in "$CLAUDE"/projects/*/memory; do
-    [ -d "$m" ] || continue
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      log "reconcile budget spent; remaining projects deferred to the next sync"
-      return 0
-    fi
-    proj="$(basename "$(dirname "$m")")"
-    prev=""
-    [ -n "$snaps" ] && [ -f "$snaps/$proj/MEMORY.md" ] && prev="$snaps/$proj/MEMORY.md"
-    "$RECONCILE" "$m" $prev || true
-  done
-}
-
-# ---- allowlist (relative to ~/.claude). Memories handled specially below. ----
-FILES=(CLAUDE.md settings.json mcp_settings.json keybindings.json)
-DIRS=(skills agents commands hooks)
-
-# Only rewrite paths inside text files; copy everything else verbatim.
-is_text(){ case "$1" in *.md|*.json|*.jsonl|*.txt|*.sh|*.bash|*.zsh|*.lua|*.toml|*.yaml|*.yml|*.cfg) return 0;; *) return 1;; esac; }
-
-# Mode must be carried explicitly. The text path writes with `sed > "$2"`, and a shell
-# redirect only truncates an existing file -- it creates a NEW one at the umask default,
-# 644. hooks/*.sh are text, so on a machine where the file already existed the mode was
-# silently preserved and the bug stayed invisible, while a machine applying them for the
-# first time got 644 and every hook died with "Permission denied". Seen on
-# Dannys-MacBook-Pro 2026-07-27, right after its first bootstrap.
-# git records only the exec bit, which is exactly the bit that matters here.
-# GNU first. With GNU coreutils `stat` on PATH (nix home-manager: /etc/profiles/per-user/*/bin),
-# `stat -f` is *filesystem* mode: it prints "  File: ..." for the real operand, exits 1 because
-# the format string was taken as a second (missing) file, and the `||` fallback then ALSO runs --
-# so the caller gets the filesystem block plus the mode. BSD `stat -c` fails cleanly with no
-# stdout, so GNU-first is correct on both. Observed 2026-08-26: line 91 died with
-# "File: unbound variable" on every run since 2026-07-27 and file_mode silently returned garbage.
-file_mode(){ stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
-# `local` is load-bearing. This was written as a bare `m=$(...)`, which collided with the
-# `for m in "$CLAUDE"/projects/*/memory` loop in collect(): the first file of each project
-# canonicalised correctly, copy_mode then overwrote m with "644", and every later
-# `rel="${p#"$m"/}"` stripped nothing -- so 30 of 31 files per project were written to
-# data/memory/<proj>/Users/dannyfroberg/.claude/projects/<proj>/memory/<file> instead of
-# data/memory/<proj>/<file>. Silent, and it corrupted the layout of every project.
-copy_mode(){ local m; m=$(file_mode "$1"); [ -n "$m" ] && chmod "$m" "$2" 2>/dev/null || true; }
-
-# Atomic, content-aware copy. Writes a sibling temp file and renames it into place, so a
-# kill mid-run (the hooks SIGTERM us at their timeout) can never leave a truncated target.
-# The previous `sed > target` truncated BEFORE writing: 19 memory files were found at 0
-# bytes on 2026-10-08 and 27 more on 2026-10-13, every one killed between the two steps.
-# Unchanged content is left alone, so mtimes stay put and git-crypt's clean filter runs
-# only on files that really changed (it ran on all 1060 before, ~33s of every push).
-# An EMPTY source never replaces a non-empty target: a 0-byte memory is a truncation, not
-# an edit, and syncing it only spreads the damage to the other machine.
-xform_file(){  # src dst from-user to-user
-  local dst="$2" tmp was_link=0
-  [ -L "$dst" ] && { was_link=1; dst="$(readlink -f "$dst")"; }   # rename must land on the target, not replace the link
-  if [ -d "$dst" ]; then                             # the source became a file where a directory stood
-    if [ "$was_link" = 1 ] || [ -n "$(ls -A "$dst")" ]; then
-      log "refusing to replace directory ${dst#"$HOME"/} with a file"; return 0   # never delete local content
-    fi
-    rmdir "$dst"
-  fi
-  tmp="$dst.sync-tmp.$$"
-  if is_text "$1"; then sed "s|/Users/$3/|/Users/$4/|g; s|-Users-$3-|-Users-$4-|g" "$1" >"$tmp"; else cp -p "$1" "$tmp"; fi
-  if [ ! -s "$tmp" ] && [ -s "$dst" ]; then
-    log "refusing to replace non-empty ${dst#"$HOME"/} with an empty source"; rm -f "$tmp"; return 0
-  fi
-  if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
-    rm -f "$tmp"
-    # git tracks only the exec bit; a chmod with unchanged content must still travel.
-    if { [ -x "$1" ] && [ ! -x "$dst" ]; } || { [ ! -x "$1" ] && [ -x "$dst" ]; }; then copy_mode "$1" "$dst"; fi
-    return 0
-  fi
-  copy_mode "$1" "$tmp"; mv -f "$tmp" "$dst"
-}
-# A path that must be a directory; a stale regular file of that name (the source turned
-# into a directory) would make `mkdir -p` fail and errexit abort every later run.
-ensure_dir(){
-  [ -d "$1" ] && return 0
-  mkdir -p "$1" 2>/dev/null && return 0
-  local a="$1"                                     # some ancestor is a stale regular file (ENOTDIR)
-  while [ "$a" != / ] && [ "$a" != . ]; do
-    if [ -e "$a" ] && [ ! -d "$a" ]; then rm -f "$a"; break; fi
-    a="$(dirname "$a")"
-  done
-  mkdir -p "$1"
-}
-canon_file(){   xform_file "$1" "$2" "$ME" "$TOKEN"; }
-decanon_file(){ xform_file "$1" "$2" "$TOKEN" "$ME"; }
-
-# The EXIT trap releases the lock on a normal exit or a SIGTERM, but NOT on SIGKILL -- and a
-# run killed by a caller's timeout is exactly when that happens. The leftover directory then
-# wedges every later sync, silently and with exit 0: "another sync is running", forever.
-# Observed 2026-07-27 after a reconcile pass was killed at five minutes. So a lock older
-# than the longest plausible run is treated as abandoned rather than trusted.
-acquire_lock(){
-  if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    age=$(( $(date +%s) - $(stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null || echo 0) ))
-    if [ "$age" -gt "${CLAUDE_SYNC_LOCK_STALE:-900}" ]; then
-      log "breaking stale lock (${age}s old; a previous run was killed)"
-      rmdir "$LOCKDIR" 2>/dev/null
-      mkdir "$LOCKDIR" 2>/dev/null || { log "another sync is running; skipping"; exit 0; }
-    else
-      log "another sync is running; skipping"; exit 0
-    fi
-  fi
-  # bash runs the EXIT trap on a normal exit but NOT when an untrapped signal kills it, and
-  # the hooks kill us with SIGTERM at their timeout: 54 "another sync is running" skips in
-  # five days (2026-10-08..13) were all this. Trap the signals so the lock goes with us.
-  trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
-  trap 'rmdir "$LOCKDIR" 2>/dev/null; exit 143' TERM INT HUP
-}
-
-# ~/.claude -> data/ (canonicalized). Writes only what changed, then prunes whatever no
-# longer exists locally. It used to `rm -rf data/` first, which rewrote all 1060 files so
-# git-crypt re-encrypted every one on `git add`, and left data/ half-built whenever a hook
-# timeout killed the run -- the half-built tree is what `pull --autostash` then stashed
-# and wedged on (27 Aug and 10 Oct 2026).
-collect(){
-  mkdir -p "$DATA"
-  rm -f "$REPO"/.collect-manifest.*            # leftovers of killed runs
-  MANIFEST="$REPO/.collect-manifest.$$"; : >"$MANIFEST"
-  keep(){ printf '%s\n' "$1" >>"$MANIFEST"; }
-  for f in "${FILES[@]}"; do
-    [ -f "$CLAUDE/$f" ] || continue
-    ensure_dir "$DATA/$(dirname "$f")"; canon_file "$CLAUDE/$f" "$DATA/$f"; keep "$DATA/$f"
-  done
-  for d in "${DIRS[@]}"; do
-    [ -d "$CLAUDE/$d" ] || continue
-    while IFS= read -r -d '' p; do
-      rel="${p#"$CLAUDE"/}"; ensure_dir "$DATA/$(dirname "$rel")"; canon_file "$p" "$DATA/$rel"; keep "$DATA/$rel"
-    done < <(find "$CLAUDE/$d" -type f ! -name '*.sync-tmp.*' -print0)
-  done
-  # memories: ~/.claude/projects/<proj>/memory/**  ->  data/memory/<canonical-proj>/**
-  for m in "$CLAUDE"/projects/*/memory; do
-    [ -d "$m" ] || continue
-    proj="$(basename "$(dirname "$m")")"
-    cproj="${proj//-Users-$ME-/-Users-$TOKEN-}"
-    while IFS= read -r -d '' p; do
-      rel="${p#"$m"/}"; ensure_dir "$DATA/memory/$cproj/$(dirname "$rel")"; canon_file "$p" "$DATA/memory/$cproj/$rel"; keep "$DATA/memory/$cproj/$rel"
-    done < <(find "$m" -type f ! -name '*.sync-tmp.*' -print0)
-  done
-  # Prune: anything in data/ this run did not produce is gone locally (or a leftover temp).
-  # `|| true`: grep exits 1 when nothing is stale, which under pipefail + errexit killed the
-  # whole run silently on the first two test pushes.
-  find "$DATA" -type f | { grep -vxF -f "$MANIFEST" || true; } | while IFS= read -r stale; do rm -f "$stale"; done
-  find "$DATA" -mindepth 1 -type d -empty -delete
-  rm -f "$MANIFEST"
-}
-
-# data/ -> ~/.claude (decanonicalized). Additive merge — never deletes local files.
-apply(){
-  # Temp files a killed earlier apply left beside their targets (seen 2026-10-13). collect
-  # already ignores them; this keeps them from piling up in ~/.claude.
-  find "$CLAUDE"/projects/*/memory "${DIRS[@]/#/$CLAUDE/}" -name '*.sync-tmp.*' -type f -delete 2>/dev/null || true
-  for f in "${FILES[@]}"; do
-    [ -f "$DATA/$f" ] || continue
-    ensure_dir "$CLAUDE/$(dirname "$f")"; decanon_file "$DATA/$f" "$CLAUDE/$f"
-  done
-  for d in "${DIRS[@]}"; do
-    [ -d "$DATA/$d" ] || continue
-    while IFS= read -r -d '' p; do
-      rel="${p#"$DATA"/}"; ensure_dir "$CLAUDE/$(dirname "$rel")"; decanon_file "$p" "$CLAUDE/$rel"
-    done < <(find "$DATA/$d" -type f ! -name '*.sync-tmp.*' -print0)
-  done
-  for cm in "$DATA"/memory/*; do
-    [ -d "$cm" ] || continue
-    cproj="$(basename "$cm")"
-    proj="${cproj//-Users-$TOKEN-/-Users-$ME-}"
-    dst="$CLAUDE/projects/$proj/memory"
-    while IFS= read -r -d '' p; do
-      rel="${p#"$cm"/}"; ensure_dir "$dst/$(dirname "$rel")"; decanon_file "$p" "$dst/$rel"
-    done < <(find "$cm" -type f ! -name '*.sync-tmp.*' -print0)
-  done
-}
-
-git_repo(){ [ -d "$REPO/.git" ] || die "no git repo at $REPO (bootstrap it first)"; }
-
-# A rebase-merge directory without `head-name` is not a rebase in progress: it is what a
-# `pull --rebase --autostash` leaves when killed between stashing and rebasing. git then
-# refuses every later pull ("already a rebase-merge directory"), and with stderr discarded
-# that read as "offline" -- for five weeks (27 Aug to 8 Oct 2026, 2493 commits stuck) and
-# again 10 to 13 Oct (404). The autostash it holds is derived data/, rebuilt by collect.
-clear_dead_rebase(){
-  local d="$REPO/.git/rebase-merge"
-  if [ -d "$d" ] && [ ! -f "$d/head-name" ]; then
-    if [ -s "$d/autostash" ]; then   # may hold more than data/ (an edit under bin/): keep it reachable
-      git -C "$REPO" stash store -m "autostash of a killed sync run" "$(cat "$d/autostash")" 2>/dev/null \
-        && log "kept the dead rebase's autostash as a stash entry" || true
-    fi
-    log "removing dead rebase-merge dir left by a killed run"; rm -rf "$d"
-  fi
-  return 0
-}
-
-# data/ is derived state, so reset it to HEAD before pulling: then --autostash has nothing
-# to stash and a kill mid-pull cannot wedge the repo. git's stderr goes to the log -- the
-# old `2>/dev/null || log "offline"` is how both wedges stayed invisible.
-sync_pull(){
-  clear_dead_rebase
-  git -C "$REPO" reset -q -- data 2>/dev/null || true       # unstage (a run killed after `git add -A`)
-  git -C "$REPO" checkout -q -- data 2>/dev/null || true    # then restore the worktree from HEAD
-  git -C "$REPO" clean -qfd -- data 2>/dev/null || true
-  local out
-  if out=$(git -C "$REPO" pull --rebase --autostash origin "$BRANCH" 2>&1); then return 0; fi
-  log "pull failed: $(printf '%s' "$out" | grep -v '^hint:' | tail -4 | tr '\n' ' ')"
-  return 1
-}
-
-# Auto-unlock git-crypt on a fresh clone: if data/ is still ciphertext and the
-# sops-decrypted key exists (placed by dotnix decryptSecrets), unlock non-interactively.
-KEYFILE="${CLAUDE_SYNC_KEY:-$HOME/.config/git-crypt/claude-sync.key}"
-ensure_unlocked(){
-  [ -f "$DATA/CLAUDE.md" ] || return 0
-  head -c 12 "$DATA/CLAUDE.md" 2>/dev/null | grep -qa GITCRYPT || return 0   # already unlocked
-  if [ -f "$KEYFILE" ]; then
-    log "git-crypt locked; unlocking with $KEYFILE"
-    ( cd "$REPO" && git-crypt unlock "$KEYFILE" ) 2>/dev/null || log "git-crypt unlock failed (bad key?)"
-  else
-    log "git-crypt locked and no key at $KEYFILE (run 'nud' to decrypt it, then retry)"
-  fi
-}
-
-cmd_push(){
-  acquire_lock; git_repo
-  sync_pull || log "continuing without a pull; the push below will say if the remote moved"
-  ensure_unlocked
-
-  # Fold in any orphans before collect, so the index this machine publishes is already
-  # complete. Combined with the post-apply pass in cmd_pull, the index converges to the
-  # union across machines without anyone having to merge markdown by hand.
-  reconcile_indexes
-
-  collect
-  git -C "$REPO" add -A
-
-  # Tripwire. collect() makes data/ mirror THIS machine's ~/.claude (pruning what is gone), and
-  # the pull above refreshes the repo WITHOUT applying anything into ~/.claude. So a
-  # machine that is behind -- most dangerously one that has just cloned -- produces a
-  # perfectly ordinary-looking commit that deletes everything the other machine owns.
-  # Measured 2026-07-27 on a fresh clone against a 5-file home: 557 deletions, the whole
-  # memory store plus every skill, agent and command. It then happened for real.
-  #
-  # Bulk deletion is therefore never assumed intentional. Real pruning says so explicitly:
-  #   CLAUDE_SYNC_ALLOW_PRUNE=1 claude-sync push
-  if [ "${CLAUDE_SYNC_ALLOW_PRUNE:-0}" != "1" ]; then
-    dels=$(git -C "$REPO" diff --cached --diff-filter=D --name-only | wc -l | tr -d ' ')
-    keep=$(git -C "$REPO" diff --cached --diff-filter=d --name-only | wc -l | tr -d ' ')
-    if [ "$dels" -gt 20 ] && [ "$dels" -gt "$keep" ]; then
-      log "REFUSING to push: would delete $dels files and keep only $keep."
-      log "This machine looks out of date. Run 'claude-sync pull' first to apply the"
-      log "remote into ~/.claude, verify your files, then push."
-      log "If the deletion really is intended: CLAUDE_SYNC_ALLOW_PRUNE=1 claude-sync push"
-      git -C "$REPO" reset -q
-      return 1
-    fi
-  fi
-
-  if git -C "$REPO" diff --cached --quiet; then
-    log "no changes"
-  else
-    git -C "$REPO" commit -q -m "sync: $ME@$(scutil --get LocalHostName 2>/dev/null || hostname -s) $(date -u +%FT%TZ)"
-  fi
-
-  # Push whenever the branch is ahead, NOT only when this run produced a commit.
-  # "no changes" used to return here, before the push -- so a commit stranded by an
-  # earlier failed push was never retried by any later run. Observed 2026-07-27: three
-  # commits, oldest 36h, all absent from the remote while every run reported success.
-  ahead=$(git -C "$REPO" rev-list --count "@{u}..HEAD" 2>/dev/null || echo 0)
-  if [ "$ahead" -eq 0 ]; then log "up to date"; return 0; fi
-
-  if out=$(git -C "$REPO" push -q origin "$BRANCH" 2>&1); then
-    log "pushed ($ahead commit(s))"
-  else
-    # Propagate the failure. The old `push && log || log` always evaluated to 0, so the
-    # timer wrapper's "re-flag and retry" branch was unreachable dead code.
-    log "push failed — $ahead commit(s) queued locally: $(printf '%s' "$out" | grep -v '^hint:' | tail -4 | tr '\n' ' ')"
-    return 1
-  fi
-}
-
-cmd_pull(){
-  acquire_lock; git_repo
-  sync_pull || { log "pull skipped"; return 0; }
-  ensure_unlocked
-
-  # Snapshot every MEMORY.md BEFORE apply overwrites it. apply is additive for memory
-  # files but replaces the index outright, so without this the entries this machine added
-  # since the last sync are simply gone -- the files stay, orphaned and invisible to future
-  # sessions, because MEMORY.md is what actually loads.
-  SNAPS=$(mktemp -d)
-  for m in "$CLAUDE"/projects/*/memory; do
-    [ -f "$m/MEMORY.md" ] || continue
-    proj="$(basename "$(dirname "$m")")"
-    mkdir -p "$SNAPS/$proj" && cp "$m/MEMORY.md" "$SNAPS/$proj/MEMORY.md"
-  done
-
-  [ -d "$DATA" ] && apply && log "applied" || log "nothing to apply"
-
-  reconcile_indexes "$SNAPS"
-  rm -rf "$SNAPS"
-}
-
-case "${1:-}" in
-  push)          cmd_push;;
-  pull)          cmd_pull;;
-  status)        git_repo; git -C "$REPO" status -sb;;
-  dry-run|dry)   acquire_lock; collect; log "canonicalized into $DATA:"; find "$DATA" -type f | sed "s|$DATA/||" | sort;;
-  *) echo "usage: claude-sync {push|pull|status|dry-run}"; exit 2;;
-esac
+# No usable interpreter: leave a trace in the log, tell the session, and exit 0 so a hook
+# never fails because of it.
+printf '%s pid=%s %s ERROR no usable python3 (3.9 or newer) found\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "${1:-?}" >> "${CLAUDE_SYNC_REPO:-$HOME/.claude-sync}/last-sync.log" 2>/dev/null || true
+echo "claude-sync: ERROR no usable python3 found (see ~/.claude-sync/last-sync.log)"
+exit 0
