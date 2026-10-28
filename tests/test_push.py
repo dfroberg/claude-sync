@@ -292,6 +292,23 @@ class PushTest(SyncTestCase):
         self.assertEqual((outside / "SKILL.md").read_text(), "outside\n")
         self.assertTrue(any("skipped 1 paths under symlinks" in ln for ln in a.log_lines()))
 
+    def test_noop_push_logs_symlink_skip_at_debug_only(self):
+        a, = self.synced("a")
+        self.remote_commit({"skills/linked/SKILL.md": "remote skill\n"})
+        a.run("pull")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "SKILL.md").write_text("remote skill\n")
+        shutil.rmtree(a.claude / "skills/linked")
+        os.symlink(outside, a.claude / "skills/linked")
+        tip = self.remote_tip()
+        a.run("push")
+        self.assertEqual(self.remote_tip(), tip)
+        self.assertFalse(any(" INFO skipped" in ln for ln in a.log_lines()))
+        a.run("push", env=a.env(CLAUDE_SYNC_DEBUG="1"))
+        self.assertTrue(any(" DEBUG skipped 1 paths under symlinks" in ln for ln in a.log_lines()))
+        self.assertFalse(any(" INFO skipped" in ln for ln in a.log_lines()))
+
     def test_push_after_unseen_landed_push_is_silent(self):  # spec test 27, push variant
         a, = self.synced("a")
         rel = LOCAL + "n.md"

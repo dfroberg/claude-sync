@@ -223,7 +223,7 @@ def run_push(ctx: Ctx) -> int:
             raise StopRun("first pull did not set the base")
     s = scan(ctx)
     if s.skipped:
-        log.info(f"skipped {len(s.skipped)} paths under symlinks")
+        (log.debug if s.empty else log.info)(f"skipped {len(s.skipped)} paths under symlinks")
     if s.empty:
         log.debug("no changes")
         report.noop = True
